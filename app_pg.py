@@ -35,7 +35,7 @@ USE_R2 = bool(R2_PUBLIC_BASE_URL)
 TRAIN_DIR = "training_images"
 TRAIN_FILES = [
     "1bad.png",
-    "2poor.png",
+    "2poor.bmp",
     "3fair.png",
     "4good.png",
     "5excellent.png",
