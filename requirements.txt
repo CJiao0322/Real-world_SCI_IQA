@@ -1,5 +1,5 @@
 streamlit==1.52.2
-psycopg[binary, pool]
+psycopg[binary]
 psycopg-pool
 Pillow
 streamlit_js_eval
