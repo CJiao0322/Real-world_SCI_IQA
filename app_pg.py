@@ -1,21 +1,23 @@
-# R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
-# USE_R2 = bool(R2_PUBLIC_BASE_URL)
+# app_pg.py
+# Requirements (render):
+#   streamlit==1.52.2
+#   psycopg[binary]
+#   psycopg-pool
+#   pillow
+#   streamlit-js-eval
 
-import os
-import streamlit as st
-# 其他 import …
-
-R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
-USE_R2 = bool(R2_PUBLIC_BASE_URL)
-
-import streamlit as st
 import os
 import csv
-from datetime import datetime
-from uuid import uuid4
-from PIL import Image
 import random
 import time
+import io
+import base64
+from datetime import datetime
+from uuid import uuid4
+
+import streamlit as st
+import streamlit.components.v1 as components
+from PIL import Image
 
 import psycopg
 from psycopg_pool import ConnectionPool
@@ -24,16 +26,19 @@ from streamlit_js_eval import streamlit_js_eval
 st.set_page_config(layout="wide")
 
 # =========================
-# Config
+# ENV / Config
 # =========================
-import os
-DSN = os.environ.get("DATABASE_URL", "postgresql://postgres.sswmzxkgdmzuelhpmvee:skype%408790%21@aws-1-ap-south-1.pooler.supabase.com:6543/postgres?sslmode=require")
+DSN = os.environ.get("DATABASE_URL", "").strip()
+if not DSN:
+    st.error("❌ Missing DATABASE_URL in environment variables.")
+    st.stop()
 
+R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").strip().rstrip("/")
+USE_R2 = bool(R2_PUBLIC_BASE_URL)
 
-# DSN = "postgresql://postgres.sswmzxkgdmzuelhpmvee:skype%408790%21@aws-1-ap-south-1.pooler.supabase.com:6543/postgres?sslmode=require"
+# 本地跑时可以用本地图片（云端基本不用）
+DATASET_ROOT = os.environ.get("DATASET_ROOT", "/Users/ttjiao/capture_all")
 
-
-DATASET_ROOT = "/Users/ttjiao/capture_all"
 MANIFEST_CSV = "manifest_6000.csv"
 TRAIN_DIR = "training_images"
 
@@ -42,12 +47,13 @@ LABELS = {
     2: "Poor（较差）— 明显失真，细节受损，文本不清晰",
     3: "Fair（一般）— 有一定失真，但仍可接受",
     4: "Good（良好）— 轻微失真，不影响正常观看",
-    5: "Excellent（优秀）— 几乎无失真，清晰自然"
+    5: "Excellent（优秀）— 几乎无失真，清晰自然",
 }
 
 VALID_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")
 TRAIN_INTERVAL_MS = 7000
 
+# 分配参数
 P = 300
 R_TARGET = 25
 N_TARGET = 6000
@@ -55,55 +61,149 @@ K_PER_PERSON = (N_TARGET * R_TARGET) // P  # 500
 COVER_M = 2
 
 # =========================
-# PG connection pool
+# PostgreSQL Pool (关键：禁用 prepared statements)
 # =========================
-# @st.cache_resource
-# def get_pool():
-#     return ConnectionPool(conninfo=DSN, min_size=1, max_size=20, timeout=30)
-
-# pool = get_pool()
-
-# @st.cache_resource
-# def get_pool():
-#     return ConnectionPool(
-#         conninfo=DSN,
-#         min_size=1,
-#         max_size=20,
-#         timeout=30,
-#         kwargs={
-#             "prepare_threshold": 0,  # ✅ 禁用 prepared statements，解决 _pg3_0 already exists
-#         },
-#     )
-
-from psycopg_pool import ConnectionPool
-
 @st.cache_resource
 def get_pool():
+    # 关键：prepare_threshold=None -> 禁用 prepared statements，避免 Supabase pooler 触发 _pg3_x 冲突
     return ConnectionPool(
         conninfo=DSN,
         min_size=1,
         max_size=20,
         timeout=30,
-        kwargs={
-            "prepared_threshold": None,  # ✅ 关键：禁用 prepared statements（兼容 pgbouncer）
-        },
+        kwargs={"prepare_threshold": None},  # ✅ 核心修复
     )
 
 pool = get_pool()
 
 
-pool = get_pool()
-
-
 def pg_exec(sql, params=None, fetch=False, fetchone=False):
+    """轻量 helper：所有 execute 都 prepare=False（再加一层保险）"""
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params or ())
+            cur.execute(sql, params or (), prepare=False)
             if fetchone:
                 return cur.fetchone()
             if fetch:
                 return cur.fetchall()
         conn.commit()
+
+
+# =========================
+# DB init + import manifest
+# =========================
+def init_db():
+    pg_exec(
+        """
+        CREATE TABLE IF NOT EXISTS participants (
+            participant_id TEXT PRIMARY KEY,
+            student_id TEXT,
+            device TEXT,
+            screen_resolution TEXT,
+            start_time TIMESTAMPTZ
+        );
+        """
+    )
+
+    pg_exec(
+        """
+        CREATE TABLE IF NOT EXISTS images (
+            image_id TEXT PRIMARY KEY,
+            rel_path TEXT NOT NULL,
+            category INT NOT NULL,
+            category_name TEXT,
+            resolution TEXT NOT NULL,
+            distortion INT NOT NULL,
+            distortion_name TEXT,
+            assigned_count INT NOT NULL DEFAULT 0
+        );
+        """
+    )
+
+    pg_exec(
+        """
+        CREATE TABLE IF NOT EXISTS assignments (
+            participant_id TEXT NOT NULL,
+            image_id TEXT NOT NULL,
+            ord INT NOT NULL,
+            assigned_time TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (participant_id, image_id)
+        );
+        """
+    )
+
+    pg_exec(
+        """
+        CREATE TABLE IF NOT EXISTS ratings (
+            participant_id TEXT NOT NULL,
+            image_id TEXT NOT NULL,
+            image_name TEXT,
+            score INT,
+            label TEXT,
+            time TIMESTAMPTZ,
+            text_clarity TEXT
+        );
+        """
+    )
+
+    # 常用索引（提升并发性能）
+    pg_exec("CREATE INDEX IF NOT EXISTS idx_images_strata ON images(category, resolution, distortion, assigned_count);")
+    pg_exec("CREATE INDEX IF NOT EXISTS idx_assignments_pid_ord ON assignments(participant_id, ord);")
+    pg_exec("CREATE INDEX IF NOT EXISTS idx_ratings_pid ON ratings(participant_id);")
+
+
+def table_count(table: str) -> int:
+    r = pg_exec(f"SELECT COUNT(*) FROM {table};", fetchone=True)
+    return int(r[0]) if r else 0
+
+
+def import_manifest_if_needed():
+    if not os.path.exists(MANIFEST_CSV):
+        st.error(f"❌ 找不到 {MANIFEST_CSV}（需要放在项目根目录）")
+        st.stop()
+
+    if table_count("images") > 0:
+        return
+
+    rows = []
+    with open(MANIFEST_CSV, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            image_id = r["image_id"].strip()
+            rel_path = r["rel_path"].strip()
+            category = int(r["category"])
+            category_name = (r.get("category_name", "") or "").strip() or None
+            resolution = r["resolution"].strip()
+            distortion = int(r["distortion"])
+            distortion_name = (r.get("distortion_name", "") or "").strip() or None
+
+            rows.append(
+                (image_id, rel_path, category, category_name, resolution, distortion, distortion_name)
+            )
+
+    # 批量插入（分块）
+    CHUNK = 1000
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            for i in range(0, len(rows), CHUNK):
+                chunk = rows[i : i + CHUNK]
+                cur.executemany(
+                    """
+                    INSERT INTO images(image_id, rel_path, category, category_name, resolution, distortion, distortion_name)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (image_id) DO NOTHING
+                    """,
+                    chunk,
+                )
+        conn.commit()
+
+    n = table_count("images")
+    if n != N_TARGET:
+        st.warning(f"⚠️ images 表共有 {n} 张（期望 {N_TARGET}）。请确认 manifest_6000.csv 行数。")
+
+
+init_db()
+import_manifest_if_needed()
 
 # =========================
 # Helpers
@@ -117,6 +217,18 @@ def list_images(folder):
         if f.lower().endswith(VALID_EXTS) and not f.startswith(".")
     )
 
+
+@st.cache_data(show_spinner=False)
+def image_as_data_url(img_path: str, max_side: int, quality: int = 88) -> str:
+    with Image.open(img_path) as im:
+        im = im.convert("RGB")
+        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+
+
 def get_assigned_image_ids(pid: str):
     rows = pg_exec(
         "SELECT image_id FROM assignments WHERE participant_id=%s ORDER BY ord ASC",
@@ -125,9 +237,11 @@ def get_assigned_image_ids(pid: str):
     )
     return [r[0] for r in rows]
 
+
 def get_image_relpath(image_id: str):
     r = pg_exec("SELECT rel_path FROM images WHERE image_id=%s", (image_id,), fetchone=True)
     return r[0] if r else None
+
 
 def fetch_distinct_axes():
     cats = [r[0] for r in pg_exec("SELECT DISTINCT category FROM images ORDER BY category", fetch=True)]
@@ -135,22 +249,22 @@ def fetch_distinct_axes():
     dists = [r[0] for r in pg_exec("SELECT DISTINCT distortion FROM images ORDER BY distortion", fetch=True)]
     return cats, ress, dists
 
+
 def assign_images_for_participant(pid: str):
-    # 已分配就不重复
+    """并发安全分配：FOR UPDATE SKIP LOCKED + 事务"""
     existing = get_assigned_image_ids(pid)
     if len(existing) >= K_PER_PERSON:
         return
 
     cats, ress, dists = fetch_distinct_axes()
 
-    # 用事务 + FOR UPDATE SKIP LOCKED 做并发安全分配（关键！）
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("BEGIN")
+            cur.execute("BEGIN", prepare=False)
 
             chosen = []
 
-            # coverage：每个 strata 取 COVER_M 张
+            # coverage
             for cat in cats:
                 for res in ress:
                     for dist in dists:
@@ -158,54 +272,85 @@ def assign_images_for_participant(pid: str):
                             """
                             SELECT image_id
                             FROM images
-                            WHERE category=%s AND resolution=%s AND distortion=%s AND assigned_count < %s
+                            WHERE category=%s
+                              AND resolution=%s
+                              AND distortion=%s
+                              AND assigned_count < %s
                             ORDER BY assigned_count ASC
                             FOR UPDATE SKIP LOCKED
                             LIMIT %s
                             """,
-                            (cat, res, dist, R_TARGET, COVER_M)
+                            (cat, res, dist, R_TARGET, COVER_M),
+                            prepare=False,
                         )
-                        rows = cur.fetchall()
-                        chosen.extend([r[0] for r in rows])
+                        chosen.extend([r[0] for r in cur.fetchall()])
 
             # 去重
             seen = set()
             chosen = [x for x in chosen if not (x in seen or seen.add(x))]
 
-            # fill：补齐到 K_PER_PERSON
+            # fill
             need = K_PER_PERSON - len(chosen)
             if need > 0:
-                cur.execute(
-                    """
-                    SELECT image_id
-                    FROM images
-                    WHERE assigned_count < %s AND NOT (image_id = ANY(%s))
-                    ORDER BY assigned_count ASC
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT %s
-                    """,
-                    (R_TARGET, chosen, need)
-                )
+                if len(chosen) == 0:
+                    cur.execute(
+                        """
+                        SELECT image_id
+                        FROM images
+                        WHERE assigned_count < %s
+                        ORDER BY assigned_count ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT %s
+                        """,
+                        (R_TARGET, need),
+                        prepare=False,
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT image_id
+                        FROM images
+                        WHERE assigned_count < %s
+                          AND NOT (image_id = ANY(%s))
+                        ORDER BY assigned_count ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT %s
+                        """,
+                        (R_TARGET, chosen, need),
+                        prepare=False,
+                    )
                 chosen.extend([r[0] for r in cur.fetchall()])
+
+            if len(chosen) == 0:
+                conn.rollback()
+                return
 
             random.shuffle(chosen)
             now = datetime.now()
 
-            # 写 assignments
-            cur.executemany(
-                """
-                INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
-                VALUES (%s,%s,%s,%s)
-                ON CONFLICT DO NOTHING
-                """,
-                [(pid, img_id, i, now) for i, img_id in enumerate(chosen)]
-            )
+            # 写 assignments（逐条插入：500条一次，完全可接受）
+            inserted = []
+            for i, img_id in enumerate(chosen):
+                cur.execute(
+                    """
+                    INSERT INTO assignments(participant_id, image_id, ord, assigned_time)
+                    VALUES (%s,%s,%s,%s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (pid, img_id, i, now),
+                    prepare=False,
+                )
+                # rowcount=1 表示新插入成功
+                if cur.rowcount == 1:
+                    inserted.append(img_id)
 
-            # 更新 assigned_count（只给本次成功插入的加 1：这里简化为对 chosen 加）
-            cur.executemany(
-                "UPDATE images SET assigned_count = assigned_count + 1 WHERE image_id=%s",
-                [(img_id,) for img_id in chosen]
-            )
+            # 只对真正插入的记录 +1，避免重复进入导致过计数
+            for img_id in inserted:
+                cur.execute(
+                    "UPDATE images SET assigned_count = assigned_count + 1 WHERE image_id=%s",
+                    (img_id,),
+                    prepare=False,
+                )
 
             conn.commit()
 
@@ -270,49 +415,17 @@ def render_intro():
     st.session_state.participant_id = pid
 
     pg_exec(
-        "INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time) VALUES (%s,%s,%s,%s,%s)",
-        (pid, student_id.strip(), device, screen_resolution, datetime.now())
+        """
+        INSERT INTO participants(participant_id, student_id, device, screen_resolution, start_time)
+        VALUES (%s,%s,%s,%s,%s)
+        """,
+        (pid, student_id.strip(), device, screen_resolution, datetime.now()),
     )
 
     assign_images_for_participant(pid)
 
     st.session_state.stage = "training"
     st.rerun()
-
-
-def image_as_data_url(img_path: str, max_side: int, quality: int = 92) -> str:
-    """Training 页：编码成 data URL 做轮播（避免 rerun），这里会压缩成 JPEG"""
-    with Image.open(img_path) as im:
-        im = im.convert("RGB")
-        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=quality, optimize=True)
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        return f"data:image/jpeg;base64,{b64}"
-
-
-# def render_training():
-#     st.markdown(
-#         """
-#         <div style="text-align:center; font-weight:950; font-size:30px; margin-top:6px;">
-#           Training / 引导示例
-#         </div>
-#         """,
-#         unsafe_allow_html=True,
-#     )
-
-#     train_imgs = list_images(TRAIN_DIR)
-#     if len(train_imgs) < 5:
-#         st.error(f"训练图目录 {TRAIN_DIR}/ 下至少需要 5 张图。当前：{len(train_imgs)}")
-#         st.stop()
-
-#     st.info("培训页你现在用的是前端轮播（压缩JPEG），评分页显示原图。培训慢一点可调 TRAIN_INTERVAL_MS。")
-
-#     if st.button("Next → Start Rating"):
-#         st.session_state.stage = "rating"
-#         st.session_state.idx = 0
-#         st.session_state.rating_start_ts = time.time()
-#         st.rerun()
 
 
 def render_training():
@@ -400,7 +513,6 @@ def render_training():
         st.rerun()
 
 
-
 def render_rating():
     pid = st.session_state.participant_id
     if not pid:
@@ -432,34 +544,22 @@ def render_rating():
         st.error("Image not found in DB.")
         st.stop()
 
-    # img_path = os.path.join(DATASET_ROOT, rel_path)
-    # if not os.path.exists(img_path):
-    #     st.error(f"找不到图片：{img_path}")
-    #     st.stop()
-
-    if USE_R2:
-        img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
-    else:
-        img_path = os.path.join(DATASET_ROOT, rel_path)
-        if not os.path.exists(img_path):
-            st.error(f"找不到图片：{img_path}")
-            st.stop()
-
-    
-
     left, right = st.columns([3.6, 1.4], gap="large")
-    # with left:
-    #     st.image(img_path, caption=rel_path, use_container_width=True)
 
-    if USE_R2:
-        img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
-        st.image(img_url, caption=rel_path, use_container_width=True)
-    else:
-        img_path = os.path.join(DATASET_ROOT, rel_path)
-        st.image(img_path, caption=rel_path, use_container_width=True)
-
+    with left:
+        if USE_R2:
+            img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
+            st.image(img_url, caption=rel_path, use_container_width=True)
+        else:
+            img_path = os.path.join(DATASET_ROOT, rel_path)
+            if not os.path.exists(img_path):
+                st.error(f"找不到图片：{img_path}\n（云端请配置 R2_PUBLIC_BASE_URL）")
+                st.stop()
+            st.image(img_path, caption=rel_path, use_container_width=True)
 
     with right:
+        st.markdown("### Rate image quality")
+
         score = st.radio(
             "Quality score",
             options=[5, 4, 3, 2, 1],
@@ -481,18 +581,23 @@ def render_rating():
     if next_clicked:
         pg_exec(
             """
-            INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
+            INSERT INTO ratings(participant_id, image_id, image_name, score, label, time, text_clarity)
             VALUES (%s,%s,%s,%s,%s,%s,%s)
             """,
-            (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
+            (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity)),
         )
         st.session_state.idx += 1
         st.rerun()
+
 
 def render_done():
     st.success("Thank you for participating! / 感谢参与！")
     st.write("You may now close this page.")
 
+
+# =========================
+# Router
+# =========================
 if st.session_state.stage == "intro":
     render_intro()
 elif st.session_state.stage == "training":
