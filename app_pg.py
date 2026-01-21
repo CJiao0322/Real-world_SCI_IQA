@@ -244,8 +244,8 @@ def get_assigned_image_ids(pid: str):
 
 def assign_images_for_participant(pid: str, slot: int):
     """
-    ✅ 不用 executemany（避免 prepared statement 冲突）
-    ✅ 全部 prepare=False
+    ✅ 超快：一次性 bulk insert（不 executemany，不 for 循环）
+    ✅ prepare=False：不会触发 prepared statement 冲突
     """
     exist = pg_fetchone(
         "SELECT 1 FROM assignments WHERE participant_id=%s LIMIT 1",
@@ -260,18 +260,20 @@ def assign_images_for_participant(pid: str, slot: int):
         st.stop()
 
     now = datetime.now()
+    ords = list(range(len(image_ids)))
+
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            for ord_i, image_id in enumerate(image_ids):
-                cur.execute(
-                    """
-                    INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
-                    VALUES (%s,%s,%s,%s)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (pid, image_id, ord_i, now),
-                    prepare=False
-                )
+            cur.execute(
+                """
+                INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
+                SELECT %s, x.image_id, x.ord, %s
+                FROM unnest(%s::text[], %s::int[]) AS x(image_id, ord)
+                ON CONFLICT DO NOTHING
+                """,
+                (pid, now, image_ids, ords),
+                prepare=False
+            )
         conn.commit()
 
 # =========================
