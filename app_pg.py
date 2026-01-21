@@ -422,25 +422,54 @@ def render_training():
 
     # ✅ 用 components.html + <img>，完全绕开 st.image 的“中间处理”
     # ✅ 预加载前后两张，翻页更快
+    # components.html(
+    #     f"""
+    #     <head>
+    #       <link rel="preload" as="image" href="{next_url}">
+    #       <link rel="preload" as="image" href="{prev_url}">
+    #     </head>
+    #     <div style="width:100%; height:78vh; overflow:auto; border:1px solid #eee; border-radius:8px;">
+    #       <img src="{cur_url}"
+    #            style="display:block; max-width:none; height:auto;"
+    #            decoding="async"
+    #            loading="eager"
+    #       />
+    #     </div>
+    #     <div style="font-size:12px; opacity:0.7; margin-top:6px;">
+    #       Source: {cur_url}
+    #     </div>
+    #     """,
+    #     height=820,
+    # )
     components.html(
-        f"""
-        <head>
-          <link rel="preload" as="image" href="{next_url}">
-          <link rel="preload" as="image" href="{prev_url}">
-        </head>
-        <div style="width:100%; height:78vh; overflow:auto; border:1px solid #eee; border-radius:8px;">
-          <img src="{cur_url}"
-               style="display:block; max-width:none; height:auto;"
-               decoding="async"
-               loading="eager"
-          />
-        </div>
-        <div style="font-size:12px; opacity:0.7; margin-top:6px;">
-          Source: {cur_url}
-        </div>
-        """,
-        height=820,
-    )
+    f"""
+    <div style="
+        width:100%;
+        height:78vh;
+        overflow:auto;
+        border:1px solid #eee;
+        border-radius:8px;
+        display:flex;
+        justify-content:center;
+        align-items:flex-start;
+        background:#fafafa;
+    ">
+      <img src="{cur_url}"
+           style="
+             max-width:1600px;   /* 👈 关键：限制最大显示宽度 */
+             width:100%;
+             height:auto;
+             object-fit:contain;
+             image-rendering:auto;
+           "
+           decoding="async"
+           loading="eager"
+      />
+    </div>
+    """,
+    height=820,
+)
+
 
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
