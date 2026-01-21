@@ -423,7 +423,7 @@ def render_training():
 
     # ✅ 显示“原图”，不做 JPEG、不做 thumbnail
     if use_local:
-        st.image(local_paths[idx], use_container_width=True, output_format="PNG")
+        st.image(local_paths[idx], output_format="PNG")
     else:
         # R2 上也保持路径 training_images/xx.png
         url = f"{R2_PUBLIC_BASE_URL}/{TRAIN_DIR}/{files[idx]}"
