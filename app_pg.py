@@ -34,11 +34,11 @@ USE_R2 = bool(R2_PUBLIC_BASE_URL)
 # 训练图（你 GitHub 已经按这个放好了）
 TRAIN_DIR = "training_images"
 TRAIN_FILES = [
-    "01_bad.png",
-    "02_poor.png",
-    "03_fair.png",
-    "04_good.png",
-    "05_excellent.png",
+    "1bad.png",
+    "2poor.png",
+    "3fair.png",
+    "4good.png",
+    "5excellent.png",
 ]
 TRAIN_INTERVAL_MS = 7000
 
