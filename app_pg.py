@@ -372,20 +372,18 @@ def render_training():
           <b>Bad / Poor</b>：失真明显，影响观看体验；<br/>
           <b>Fair</b>：存在一定失真，但仍可接受；<br/>
           <b>Good / Excellent</b>：图像清晰自然，几乎无明显失真。<br/>
-          以下示例仅用于帮助理解评分标准，不会记录分数。培训完请点击下方按钮开始打分。
+          以下示例仅用于帮助理解评分标准，不会记录分数。
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # ✅ 固定顺序：按 TRAIN_FILES
     paths = [os.path.join(TRAIN_DIR, f) for f in TRAIN_FILES]
     missing = [p for p in paths if not os.path.exists(p)]
     if missing:
         st.error("training_images 缺少文件：\n" + "\n".join(missing))
         st.stop()
 
-    urls = [image_as_data_url(p, max_side=2400, quality=88) for p in paths]
     caps = [
         f"1 — {LABELS[1]}",
         f"2 — {LABELS[2]}",
@@ -394,62 +392,32 @@ def render_training():
         f"5 — {LABELS[5]}",
     ]
 
-    components.html(
-        f"""
-        <div style="width:100%; display:flex; justify-content:center;">
-          <div style="width:min(1800px, 98vw); text-align:center;">
-            <img id="trainImg"
-                 style="
-                    width:100%;
-                    height:auto;
-                    max-height: 78vh;
-                    object-fit: contain;
-                    border-radius:18px;
-                    border:1px solid rgba(0,0,0,0.10);
-                    box-shadow:0 18px 48px rgba(0,0,0,0.18);
-                    background:#fff;
-                 " />
-            <div id="trainCap"
-                 style="margin-top:12px; font-size:22px; font-weight:950;"></div>
-            <div style="opacity:0.65; font-weight:800; font-size:13px; margin-top:6px;">
-              Training only · No scores recorded
-            </div>
-          </div>
-        </div>
+    idx = st.session_state.get("train_idx", 0)
 
-        <script>
-          const urls = {urls};
-          const caps = {caps};
-          const interval = {TRAIN_INTERVAL_MS};
-
-          const img = document.getElementById("trainImg");
-          const cap = document.getElementById("trainCap");
-
-          let i = 0;
-          function show() {{
-            img.src = urls[i];
-            cap.textContent = caps[i];
-          }}
-
-          show();
-
-          setTimeout(() => {{
-            setInterval(() => {{
-              i = (i + 1) % urls.length;
-              show();
-            }}, interval);
-          }}, 700);
-        </script>
-        """,
-        height=760,
+    st.image(
+        paths[idx],
+        caption=caps[idx],
+        use_container_width=True,
     )
 
-    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-    if st.button("Next → Start Rating"):
-        st.session_state.stage = "rating"
-        st.session_state.idx = 0
-        st.session_state.rating_start_ts = time.time()
-        st.rerun()
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("⬅ Previous", disabled=(idx == 0)):
+            st.session_state.train_idx = idx - 1
+            st.rerun()
+
+    with col2:
+        if idx < len(paths) - 1:
+            if st.button("Next ➡"):
+                st.session_state.train_idx = idx + 1
+                st.rerun()
+        else:
+            if st.button("Start Rating"):
+                st.session_state.pop("train_idx", None)
+                st.session_state.stage = "rating"
+                st.session_state.idx = 0
+                st.session_state.rating_start_ts = time.time()
+                st.rerun()
 
 def render_rating():
     pid = st.session_state.participant_id
