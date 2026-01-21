@@ -7,6 +7,7 @@ from datetime import datetime
 import streamlit as st
 import psycopg
 from psycopg_pool import ConnectionPool
+from streamlit import components.v1 as components  # ✅ for components.html
 
 # =========================
 # Logging
@@ -27,13 +28,16 @@ if not DSN:
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
 USE_R2 = bool(R2_PUBLIC_BASE_URL)
 if not USE_R2:
-    st.warning("R2_PUBLIC_BASE_URL not set. Images may not load from R2.")
+    st.error("R2_PUBLIC_BASE_URL not set. This app expects images loaded from R2.")
+    st.stop()
 
 P = 300
 R_TARGET = 25
 N_TARGET = 6000
 K_PER_PERSON = (N_TARGET * R_TARGET) // P  # 500
 COVER_M = 2
+
+TRAIN_INTERVAL_MS = 7000  # ✅ keep yours
 
 LABELS = {
     1: "Bad（差）— 严重失真，如明显模糊、强噪声、文本难以辨认",
@@ -44,22 +48,21 @@ LABELS = {
 }
 
 # =========================
-# Pool  (保守，避免 Render + Supabase pooler 卡死)
+# Pool  (Render + Supabase pooler 更稳)
 # =========================
 @st.cache_resource
 def get_pool():
     return ConnectionPool(
         conninfo=DSN,
         min_size=1,
-        max_size=3,      # ✅ 小一点更稳，避免 pooler 抽风
+        max_size=3,
         timeout=60,
     )
 
 pool = get_pool()
 
 # =========================
-# Connection init per-use  ✅关键：每次拿到连接就跑一下初始化SQL
-# 不需要 after_connect，也不需要往 DSN 里加 prepare_threshold
+# Connection init per-use
 # =========================
 INIT_SQL = """
 SET statement_timeout = '30s';
@@ -68,13 +71,11 @@ SET plan_cache_mode = force_generic_plan;
 """
 
 def _init_conn(conn):
-    # 每次从池子拿到 conn，轻量初始化（几毫秒）
     try:
         with conn.cursor() as cur:
             cur.execute(INIT_SQL)
         conn.commit()
     except Exception:
-        # 初始化失败也别让连接挂住
         try:
             conn.rollback()
         except Exception:
@@ -83,7 +84,7 @@ def _init_conn(conn):
 def pg_exec(sql, params=None, fetch=False, fetchone=False):
     t0 = time.time()
     with pool.connection(timeout=60) as conn:
-        _init_conn(conn)  # ✅ 在这里做 init
+        _init_conn(conn)
 
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
@@ -100,8 +101,24 @@ def pg_exec(sql, params=None, fetch=False, fetchone=False):
     return res
 
 # =========================
-# Assignment: 一次性 join 取 rel_path，避免 rating 页面每张图查DB
+# Helpers
 # =========================
+def r2_url(rel_path: str) -> str:
+    return f"{R2_PUBLIC_BASE_URL}/{rel_path.lstrip('/')}"
+
+@st.cache_data(show_spinner=False, ttl=600)
+def get_training_relpaths(limit=5):
+    """
+    ✅ 不依赖本地 TRAIN_DIR
+    直接从 images 表拿 5 张做 training（非常快：按 image_id 排序 + LIMIT）
+    """
+    rows = pg_exec(
+        "SELECT rel_path FROM images ORDER BY image_id ASC LIMIT %s",
+        (limit,),
+        fetch=True,
+    )
+    return [r[0] for r in rows] if rows else []
+
 def assign_images_for_participant(pid: str):
     row = pg_exec("SELECT COUNT(*) FROM assignments WHERE participant_id=%s", (pid,), fetchone=True)
     already = int(row[0]) if row else 0
@@ -115,7 +132,6 @@ def assign_images_for_participant(pid: str):
         with conn.cursor() as cur:
             cur.execute("BEGIN")
 
-            # ✅ 用窗口函数做 coverage + fill，SQL 数量很少
             cur.execute(
                 """
                 WITH ranked AS (
@@ -153,13 +169,11 @@ def assign_images_for_participant(pid: str):
             )
             chosen = [r[0] for r in cur.fetchall()]
 
-            # 去重 + 截断
             seen = set()
             chosen = [x for x in chosen if not (x in seen or seen.add(x))]
             if len(chosen) > K_PER_PERSON:
                 chosen = chosen[:K_PER_PERSON]
 
-            # 写入 assignments
             cur.executemany(
                 """
                 INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
@@ -169,7 +183,6 @@ def assign_images_for_participant(pid: str):
                 [(pid, img_id, i, now) for i, img_id in enumerate(chosen)]
             )
 
-            # 更新 assigned_count
             cur.execute(
                 "UPDATE images SET assigned_count = assigned_count + 1 WHERE image_id = ANY(%s)",
                 (chosen,)
@@ -203,6 +216,8 @@ if "assigned" not in st.session_state:
     st.session_state.assigned = []
 if "rating_start_ts" not in st.session_state:
     st.session_state.rating_start_ts = None
+if "training_urls" not in st.session_state:
+    st.session_state.training_urls = None
 
 # =========================
 # Pages
@@ -228,14 +243,14 @@ def render_intro():
     pid = str(uuid4())
     st.session_state.participant_id = pid
 
-    # ✅ 先测连接（日志里会显示耗时）
+    # quick connection test
     try:
         pg_exec("SELECT 1", fetchone=True)
     except Exception as e:
         st.error(f"DB connection failed: {e}")
         st.stop()
 
-    # 写 participants
+    # insert participant
     pg_exec(
         """
         INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time)
@@ -253,10 +268,104 @@ def render_intro():
     st.session_state.assigned = prefetch_assignments(pid)
     log.info("Prefetch %d finished %.2fs", len(st.session_state.assigned), time.time() - t1)
 
-    st.session_state.stage = "rating"
+    # ✅ training samples (from DB -> R2 URL)
+    train_rel = get_training_relpaths(5)
+    st.session_state.training_urls = [r2_url(p) for p in train_rel]
+
+    st.session_state.stage = "training"  # ✅ intro -> training
     st.session_state.idx = 0
-    st.session_state.rating_start_ts = time.time()
+    st.session_state.rating_start_ts = None
     st.rerun()
+
+# ✅ 你给的 training 函数（稍微改动：urls 直接用 R2，不用本地 list_images / image_as_data_url）
+def render_training():
+    st.markdown(
+        """
+        <div style="text-align:center; font-weight:950; font-size:30px; margin-top:6px;">
+          Training / 引导示例
+        </div>
+        <div style="text-align:center; opacity:0.85; font-weight:800; margin-top:10px; margin-bottom:12px; line-height:1.7;">
+          请观察图像整体质量，并理解不同评分等级的含义。<br/>
+          评分主要依据：清晰度、自然程度、以及是否存在明显失真（模糊、噪声、伪影、压缩痕迹、文本难以辨认等）。<br/>
+          <b>Bad / Poor</b>：失真明显，影响观看体验；<br/>
+          <b>Fair</b>：存在一定失真，但仍可接受；<br/>
+          <b>Good / Excellent</b>：图像清晰自然，几乎无明显失真。<br/>
+          以下示例仅用于帮助理解评分标准，不会记录分数。培训完请点击下方按钮开始打分。
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    urls = st.session_state.training_urls or []
+    if len(urls) < 5:
+        # fallback：临时再取一次
+        train_rel = get_training_relpaths(5)
+        urls = [r2_url(p) for p in train_rel]
+        st.session_state.training_urls = urls
+
+    if len(urls) < 5:
+        st.error("Training images not available (need at least 5). Check images table / R2 paths.")
+        st.stop()
+
+    urls = urls[:5]
+    caps = [f"{i+1} — {LABELS[i+1]}" for i in range(5)]
+
+    components.html(
+        f"""
+        <div style="width:100%; display:flex; justify-content:center;">
+          <div style="width:min(1800px, 98vw); text-align:center;">
+            <img id="trainImg"
+                 style="
+                    width:100%;
+                    height:auto;
+                    max-height: 78vh;
+                    object-fit: contain;
+                    border-radius:18px;
+                    border:1px solid rgba(0,0,0,0.10);
+                    box-shadow:0 18px 48px rgba(0,0,0,0.18);
+                    background:#fff;
+                 " />
+            <div id="trainCap"
+                 style="margin-top:12px; font-size:22px; font-weight:950;"></div>
+            <div style="opacity:0.65; font-weight:800; font-size:13px; margin-top:6px;">
+              Training only · No scores recorded
+            </div>
+          </div>
+        </div>
+
+        <script>
+          const urls = {urls};
+          const caps = {caps};
+          const interval = {TRAIN_INTERVAL_MS};
+
+          const img = document.getElementById("trainImg");
+          const cap = document.getElementById("trainCap");
+
+          let i = 0;
+          function show() {{
+            img.src = urls[i];
+            cap.textContent = caps[i];
+          }}
+
+          show();
+
+          setTimeout(() => {{
+            setInterval(() => {{
+              i = (i + 1) % urls.length;
+              show();
+            }}, interval);
+          }}, 700);
+        </script>
+        """,
+        height=760,
+    )
+
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+    if st.button("Next → Start Rating"):
+        st.session_state.stage = "rating"
+        st.session_state.idx = 0
+        st.session_state.rating_start_ts = time.time()
+        st.rerun()
 
 def render_rating():
     pid = st.session_state.participant_id
@@ -277,7 +386,10 @@ def render_rating():
     total = len(pairs)
     done = st.session_state.idx
 
-    elapsed = time.time() - (st.session_state.rating_start_ts or time.time())
+    if st.session_state.rating_start_ts is None:
+        st.session_state.rating_start_ts = time.time()
+
+    elapsed = time.time() - st.session_state.rating_start_ts
     sec_per = elapsed / max(1, done)
     remaining_sec = max(0, (total - done) * sec_per)
 
@@ -293,11 +405,7 @@ def render_rating():
 
     left, right = st.columns([3.6, 1.4], gap="large")
     with left:
-        if USE_R2:
-            st.image(f"{R2_PUBLIC_BASE_URL}/{rel_path}", caption=rel_path, use_container_width=True)
-        else:
-            st.error("R2_PUBLIC_BASE_URL not set.")
-            st.stop()
+        st.image(r2_url(rel_path), caption=rel_path, use_container_width=True)
 
     with right:
         score = st.radio(
@@ -336,6 +444,8 @@ def render_done():
 # =========================
 if st.session_state.stage == "intro":
     render_intro()
+elif st.session_state.stage == "training":
+    render_training()
 elif st.session_state.stage == "rating":
     render_rating()
 else:
