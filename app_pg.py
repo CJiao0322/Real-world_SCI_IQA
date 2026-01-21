@@ -394,11 +394,21 @@ def render_training():
 
     idx = st.session_state.get("train_idx", 0)
 
+    # st.image(
+    #     paths[idx],
+    #     caption=caps[idx],
+    #     use_container_width=True,
+    # )
     st.image(
-        paths[idx],
-        caption=caps[idx],
-        use_container_width=True,
-    )
+    paths[idx],
+    caption=caps[idx],
+    use_container_width=False,   # ✅ 不强行拉伸
+    output_format="PNG",         # ✅ 强制不转 JPEG
+)    
+    w = st.slider("Zoom (px width)", 800, 2400, 1600, step=100)
+    st.image(paths[idx], caption=caps[idx], width=w, output_format="PNG")
+
+
 
     col1, col2 = st.columns([1, 1])
     with col1:
