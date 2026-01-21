@@ -1,44 +1,34 @@
 import os
 import time
-import logging
-from uuid import uuid4
+import random
+import csv
 from datetime import datetime
+from uuid import uuid4
 
 import streamlit as st
+import streamlit.components.v1 as components
+from streamlit_js_eval import streamlit_js_eval
+
 import psycopg
 from psycopg_pool import ConnectionPool
-import streamlit.components.v1 as components
 
-
-# =========================
-# Logging
-# =========================
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("app")
 
 st.set_page_config(layout="wide")
 
+
 # =========================
-# ENV
+# Config
 # =========================
 DSN = os.environ.get("DATABASE_URL", "").strip()
 if not DSN:
-    st.error("Missing env var DATABASE_URL")
+    st.error("Missing env var: DATABASE_URL")
     st.stop()
 
-R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
+R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").strip().rstrip("/")
 USE_R2 = bool(R2_PUBLIC_BASE_URL)
-if not USE_R2:
-    st.error("R2_PUBLIC_BASE_URL not set. This app expects images loaded from R2.")
-    st.stop()
 
-P = 300
-R_TARGET = 25
-N_TARGET = 6000
-K_PER_PERSON = (N_TARGET * R_TARGET) // P  # 500
-COVER_M = 2
-
-TRAIN_INTERVAL_MS = 7000  # ✅ keep yours
+TRAIN_DIR = "training_images"
+TRAIN_INTERVAL_MS = 7000
 
 LABELS = {
     1: "Bad（差）— 严重失真，如明显模糊、强噪声、文本难以辨认",
@@ -48,177 +38,138 @@ LABELS = {
     5: "Excellent（优秀）— 几乎无失真，清晰自然"
 }
 
+
 # =========================
-# Pool  (Render + Supabase pooler 更稳)
+# PG Pool (fast + safe)
 # =========================
 @st.cache_resource
 def get_pool():
-    return ConnectionPool(
-        conninfo=DSN,
-        min_size=1,
-        max_size=3,
-        timeout=60,
-    )
+    # 注意：psycopg3 的 prepared statement 问题，我们不用任何 prepare_threshold 参数
+    return ConnectionPool(conninfo=DSN, min_size=1, max_size=20, timeout=30)
 
 pool = get_pool()
 
-# =========================
-# Connection init per-use
-# =========================
-INIT_SQL = """
-SET statement_timeout = '30s';
-SET idle_in_transaction_session_timeout = '30s';
-SET plan_cache_mode = force_generic_plan;
-"""
-
-def _init_conn(conn):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(INIT_SQL)
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
 
 def pg_exec(sql, params=None, fetch=False, fetchone=False):
-    t0 = time.time()
-    with pool.connection(timeout=60) as conn:
-        _init_conn(conn)
-
+    with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
             if fetchone:
-                res = cur.fetchone()
-            elif fetch:
-                res = cur.fetchall()
-            else:
-                res = None
-
+                return cur.fetchone()
+            if fetch:
+                return cur.fetchall()
         conn.commit()
 
-    log.info("SQL %.2fs | %s", time.time() - t0, sql.strip().splitlines()[0][:120])
-    return res
 
 # =========================
-# Helpers
+# DB helpers (slot-based)
 # =========================
-def r2_url(rel_path: str) -> str:
-    return f"{R2_PUBLIC_BASE_URL}/{rel_path.lstrip('/')}"
-
-@st.cache_data(show_spinner=False, ttl=600)
-def get_training_relpaths(limit=5):
-    """
-    ✅ 不依赖本地 TRAIN_DIR
-    直接从 images 表拿 5 张做 training（非常快：按 image_id 排序 + LIMIT）
-    """
-    rows = pg_exec(
-        "SELECT rel_path FROM images ORDER BY image_id ASC LIMIT %s",
-        (limit,),
-        fetch=True,
+@st.cache_data(ttl=60)
+def get_exp_config():
+    r = pg_exec(
+        "SELECT p_total, r_target, n_images, k_per_person FROM exp_config WHERE id=1",
+        fetchone=True
     )
-    return [r[0] for r in rows] if rows else []
+    if not r:
+        return None
+    return {"P": int(r[0]), "R": int(r[1]), "N": int(r[2]), "K": int(r[3])}
 
-def assign_images_for_participant(pid: str):
-    row = pg_exec("SELECT COUNT(*) FROM assignments WHERE participant_id=%s", (pid,), fetchone=True)
-    already = int(row[0]) if row else 0
-    if already >= K_PER_PERSON:
-        return
 
-    now = datetime.now()
+def get_next_slot_and_increment():
+    """
+    原子发号：slot_counter.next_slot 从 1 开始，取完 +1
+    如果超过 P，就循环回 1（你也可以改成“超过就停止”）
+    """
+    cfg = get_exp_config()
+    if not cfg:
+        raise RuntimeError("exp_config not found, please run make_assignment_plan_from_manifest.py")
 
-    with pool.connection(timeout=60) as conn:
-        _init_conn(conn)
+    P = cfg["P"]
+
+    with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("BEGIN")
+            # 锁住这行，保证并发安全
+            cur.execute("SELECT next_slot FROM slot_counter WHERE id=1 FOR UPDATE")
+            row = cur.fetchone()
+            if not row:
+                cur.execute("INSERT INTO slot_counter (id, next_slot) VALUES (1, 1)")
+                next_slot = 1
+            else:
+                next_slot = int(row[0])
 
-            cur.execute(
-                """
-                WITH ranked AS (
-                  SELECT
-                    image_id,
-                    row_number() OVER (
-                      PARTITION BY category, resolution, distortion
-                      ORDER BY assigned_count ASC, image_id ASC
-                    ) AS rn
-                  FROM images
-                  WHERE assigned_count < %s
-                ),
-                coverage AS (
-                  SELECT image_id FROM ranked WHERE rn <= %s
-                ),
-                fill AS (
-                  SELECT image_id
-                  FROM images
-                  WHERE assigned_count < %s
-                    AND image_id NOT IN (SELECT image_id FROM coverage)
-                  ORDER BY assigned_count ASC, image_id ASC
-                  LIMIT %s
-                ),
-                picked AS (
-                  SELECT image_id FROM coverage
-                  UNION ALL
-                  SELECT image_id FROM fill
-                )
-                SELECT i.image_id
-                FROM images i
-                JOIN picked p ON p.image_id = i.image_id
-                FOR UPDATE SKIP LOCKED
-                """,
-                (R_TARGET, COVER_M, R_TARGET, K_PER_PERSON)
-            )
-            chosen = [r[0] for r in cur.fetchall()]
+            slot = next_slot
+            next_slot = next_slot + 1
+            if next_slot > P:
+                next_slot = 1
 
-            seen = set()
-            chosen = [x for x in chosen if not (x in seen or seen.add(x))]
-            if len(chosen) > K_PER_PERSON:
-                chosen = chosen[:K_PER_PERSON]
-
-            cur.executemany(
-                """
-                INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
-                VALUES (%s,%s,%s,%s)
-                ON CONFLICT DO NOTHING
-                """,
-                [(pid, img_id, i, now) for i, img_id in enumerate(chosen)]
-            )
-
-            cur.execute(
-                "UPDATE images SET assigned_count = assigned_count + 1 WHERE image_id = ANY(%s)",
-                (chosen,)
-            )
-
+            cur.execute("UPDATE slot_counter SET next_slot=%s WHERE id=1", (next_slot,))
             conn.commit()
 
-def prefetch_assignments(pid: str):
-    return pg_exec(
-        """
-        SELECT a.image_id, i.rel_path
-        FROM assignments a
-        JOIN images i ON i.image_id = a.image_id
-        WHERE a.participant_id=%s
-        ORDER BY a.ord ASC
-        """,
-        (pid,),
+    return slot
+
+
+def get_plan_image_ids_by_slot(slot: int):
+    rows = pg_exec(
+        "SELECT image_id FROM assignment_plan WHERE slot=%s ORDER BY ord ASC",
+        (slot,),
         fetch=True
     )
+    return [r[0] for r in rows]
+
+
+@st.cache_data(ttl=3600)
+def get_image_relpath(image_id: str):
+    r = pg_exec("SELECT rel_path FROM images WHERE image_id=%s", (image_id,), fetchone=True)
+    return r[0] if r else None
+
 
 # =========================
-# Session init
+# UI helpers
+# =========================
+@st.cache_data(show_spinner=False)
+def list_images(folder):
+    exts = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")
+    if not os.path.exists(folder):
+        return []
+    return sorted([f for f in os.listdir(folder) if f.lower().endswith(exts) and not f.startswith(".")])
+
+
+@st.cache_data(show_spinner=False)
+def image_as_data_url(img_path: str, max_side: int, quality: int = 88) -> str:
+    # training 用，尽量快
+    from PIL import Image
+    import io, base64
+
+    with Image.open(img_path) as im:
+        im = im.convert("RGB")
+        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+
+
+def img_url_from_relpath(rel_path: str) -> str:
+    # rel_path 里面可能有空格/特殊字符，保险起见 encode
+    from urllib.parse import quote
+    return f"{R2_PUBLIC_BASE_URL}/{quote(rel_path)}"
+
+
+# =========================
+# Session State
 # =========================
 if "stage" not in st.session_state:
     st.session_state.stage = "intro"
 if "participant_id" not in st.session_state:
     st.session_state.participant_id = None
+if "slot" not in st.session_state:
+    st.session_state.slot = None
+if "assigned_ids" not in st.session_state:
+    st.session_state.assigned_ids = None
 if "idx" not in st.session_state:
     st.session_state.idx = 0
-if "assigned" not in st.session_state:
-    st.session_state.assigned = []
-if "rating_start_ts" not in st.session_state:
-    st.session_state.rating_start_ts = None
-if "training_urls" not in st.session_state:
-    st.session_state.training_urls = None
+
 
 # =========================
 # Pages
@@ -226,59 +177,96 @@ if "training_urls" not in st.session_state:
 def render_intro():
     st.title("Image Quality Assessment Experiment")
 
+    cfg = get_exp_config()
+    if cfg:
+        st.caption(f"Experiment config: N={cfg['N']} images · P={cfg['P']} slots · K={cfg['K']} per person · R={cfg['R']}")
+
     with st.form("intro_form"):
         student_id = st.text_input("Student ID / 学号", "")
         device = st.selectbox("Device / 设备", ["PC / Laptop", "Tablet", "Phone", "Other"])
+
+        detected_physical = streamlit_js_eval(
+            js_expressions="""
+            (() => {
+              const sw = screen.width, sh = screen.height;
+              const dpr = window.devicePixelRatio || 1;
+              const pw = Math.round(sw * dpr);
+              const ph = Math.round(sh * dpr);
+              return `${pw}x${ph}`;
+            })()
+            """,
+            key="DETECTED_PHYSICAL",
+            want_output=True,
+        )
+
         resolution_choice = st.selectbox(
             "Screen Resolution / 请选择屏幕分辨率",
-            ["1920×1080", "2560×1440", "3840×2160", "I don’t know", "Other"],
+            ["1920×1080", "2560×1440", "3840×2160", "I don’t know (auto-detect)", "Other"],
         )
+
+        if resolution_choice == "I don’t know (auto-detect)":
+            st.caption(f"Auto-detected physical resolution: {detected_physical}")
+
         submitted = st.form_submit_button("Start Experiment")
 
     if not submitted:
         return
+
     if student_id.strip() == "":
         st.error("Please enter your student ID.")
         return
 
+    if resolution_choice == "I don’t know (auto-detect)":
+        screen_resolution = f"auto:{detected_physical or 'unknown'}"
+    elif resolution_choice == "Other":
+        screen_resolution = "manual:other"
+    else:
+        screen_resolution = f"manual:{resolution_choice.replace('×','x')}"
+
+    # 1) 发一个 slot（并发安全）
+    slot = get_next_slot_and_increment()
+
+    # 2) participant_id
     pid = str(uuid4())
-    st.session_state.participant_id = pid
 
-    # quick connection test
-    try:
-        pg_exec("SELECT 1", fetchone=True)
-    except Exception as e:
-        st.error(f"DB connection failed: {e}")
-        st.stop()
-
-    # insert participant
+    # 3) 写 participants
     pg_exec(
         """
         INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time)
         VALUES (%s,%s,%s,%s,%s)
         """,
-        (pid, student_id.strip(), device, resolution_choice, datetime.now())
+        (pid, student_id.strip(), device, screen_resolution, datetime.now())
     )
 
-    # assign + prefetch
-    t0 = time.time()
-    assign_images_for_participant(pid)
-    log.info("Assign finished %.2fs", time.time() - t0)
+    # 4) 读取该 slot 的图片列表（一次拿完，存在 session，后续不再查计划表）
+    assigned_ids = get_plan_image_ids_by_slot(slot)
+    if not assigned_ids:
+        st.error(f"No images found for slot={slot}. Please check assignment_plan import.")
+        return
 
-    t1 = time.time()
-    st.session_state.assigned = prefetch_assignments(pid)
-    log.info("Prefetch %d finished %.2fs", len(st.session_state.assigned), time.time() - t1)
+    # 5) 写 assignments（可选，但建议保留：方便你后续查某人拿了哪些图）
+    now = datetime.now()
+    rows = [(pid, img_id, i, now) for i, img_id in enumerate(assigned_ids)]
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT DO NOTHING
+                """,
+                rows
+            )
+        conn.commit()
 
-    # ✅ training samples (from DB -> R2 URL)
-    train_rel = get_training_relpaths(5)
-    st.session_state.training_urls = [r2_url(p) for p in train_rel]
-
-    st.session_state.stage = "training"  # ✅ intro -> training
+    st.session_state.participant_id = pid
+    st.session_state.slot = slot
+    st.session_state.assigned_ids = assigned_ids
     st.session_state.idx = 0
-    st.session_state.rating_start_ts = None
+    st.session_state.stage = "training"
     st.rerun()
 
-# ✅ 你给的 training 函数（稍微改动：urls 直接用 R2，不用本地 list_images / image_as_data_url）
+
 def render_training():
     st.markdown(
         """
@@ -297,18 +285,15 @@ def render_training():
         unsafe_allow_html=True,
     )
 
-    urls = st.session_state.training_urls or []
-    if len(urls) < 5:
-        # fallback：临时再取一次
-        train_rel = get_training_relpaths(5)
-        urls = [r2_url(p) for p in train_rel]
-        st.session_state.training_urls = urls
-
-    if len(urls) < 5:
-        st.error("Training images not available (need at least 5). Check images table / R2 paths.")
+    train_imgs = list_images(TRAIN_DIR)
+    if len(train_imgs) < 5:
+        st.error(f"训练图目录 {TRAIN_DIR}/ 下至少需要 5 张图。当前：{len(train_imgs)}")
         st.stop()
 
-    urls = urls[:5]
+    # ✅ 确定性：固定取前 5 张（按文件名排序）
+    train_imgs = train_imgs[:5]
+
+    urls = [image_as_data_url(os.path.join(TRAIN_DIR, f), max_side=2400, quality=88) for f in train_imgs]
     caps = [f"{i+1} — {LABELS[i+1]}" for i in range(5)]
 
     components.html(
@@ -368,59 +353,68 @@ def render_training():
         st.session_state.rating_start_ts = time.time()
         st.rerun()
 
+
 def render_rating():
     pid = st.session_state.participant_id
-    pairs = st.session_state.assigned
+    assigned_ids = st.session_state.assigned_ids
 
-    if not pid:
-        st.error("No participant id.")
+    if not pid or not assigned_ids:
+        st.error("Session lost. Please restart from the homepage.")
         st.stop()
 
-    if not pairs:
-        st.warning("No assignments found. Retrying...")
-        st.session_state.assigned = prefetch_assignments(pid)
-        pairs = st.session_state.assigned
-        if not pairs:
-            st.error("Still no assignments. Check DB.")
-            st.stop()
-
-    total = len(pairs)
+    total = len(assigned_ids)
     done = st.session_state.idx
 
-    if st.session_state.rating_start_ts is None:
+    if "rating_start_ts" not in st.session_state:
         st.session_state.rating_start_ts = time.time()
 
     elapsed = time.time() - st.session_state.rating_start_ts
     sec_per = elapsed / max(1, done)
     remaining_sec = max(0, (total - done) * sec_per)
 
-    st.progress(done / total if total else 0, text=f"Progress: {done}/{total}")
-    st.caption(f"Elapsed: {elapsed/60:.1f} min · Avg: {sec_per:.1f}s/img · ETA: {remaining_sec/60:.1f} min")
+    st.progress(done / total if total else 0, text=f"Progress: {done}/{total} images completed")
+    st.caption(f"Elapsed: {elapsed/60:.1f} min · Avg: {sec_per:.1f}s/image · ETA: {remaining_sec/60:.1f} min")
 
     if done >= total:
         st.session_state.stage = "done"
         st.rerun()
         return
 
-    image_id, rel_path = pairs[done]
+    image_id = assigned_ids[done]
+    rel_path = get_image_relpath(image_id)
+    if not rel_path:
+        st.error("Image not found in DB.")
+        st.stop()
 
     left, right = st.columns([3.6, 1.4], gap="large")
+
     with left:
-        st.image(r2_url(rel_path), caption=rel_path, use_container_width=True)
+        if USE_R2:
+            st.image(img_url_from_relpath(rel_path), caption=rel_path, use_container_width=True)
+        else:
+            st.error("R2_PUBLIC_BASE_URL not set. Please set it in Render env.")
+            st.stop()
 
     with right:
+        st.markdown("### Rate image quality")
+
         score = st.radio(
-            "Quality score",
+            "",
             options=[5, 4, 3, 2, 1],
             index=None,
             key=f"score_{done}",
             format_func=lambda x: f"{x} — {LABELS[x]}",
+            label_visibility="collapsed",
         )
+
+        st.markdown("---")
+        st.markdown("**Text clarity / 文本清晰度**")
         text_clarity = st.radio(
-            "Text clarity / 文本清晰度",
+            "",
             options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
             index=None,
             key=f"text_{done}",
+            label_visibility="collapsed",
         )
 
         next_clicked = st.button("Next", disabled=(score is None or text_clarity is None))
@@ -436,9 +430,13 @@ def render_rating():
         st.session_state.idx += 1
         st.rerun()
 
+
 def render_done():
-    st.success("Thank you! / 感谢参与！")
-    st.write("You may close this page.")
+    if "rating_start_ts" in st.session_state:
+        del st.session_state["rating_start_ts"]
+    st.success("Thank you for participating! / 感谢参与！")
+    st.write("You may now close this page.")
+
 
 # =========================
 # Router
