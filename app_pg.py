@@ -1,6 +1,12 @@
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
 USE_R2 = bool(R2_PUBLIC_BASE_URL)
 
+import os
+import streamlit as st
+# 其他 import …
+
+R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
+
 
 import streamlit as st
 import os
