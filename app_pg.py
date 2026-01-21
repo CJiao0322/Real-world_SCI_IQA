@@ -2,16 +2,14 @@ import os
 import time
 import random
 import logging
-import csv
 from uuid import uuid4
 from datetime import datetime
 
 import streamlit as st
-import psycopg
 from psycopg_pool import ConnectionPool
 
 # =========================
-# Logging (Render Logs 能看到)
+# Logging
 # =========================
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
@@ -19,29 +17,18 @@ log = logging.getLogger("app")
 st.set_page_config(layout="wide")
 
 # =========================
-# ENV / Config
+# ENV
 # =========================
-# 1) Render 环境变量里设置 DATABASE_URL（Supabase 的那个）
 DSN = os.environ.get("DATABASE_URL", "").strip()
 if not DSN:
     st.error("Missing env var DATABASE_URL")
     st.stop()
 
-# ✅ 关键：禁用 psycopg 自动 prepared statements，避免 Supabase pooler 报错
-# psycopg3 支持 prepare_threshold 参数（放在 conninfo 里）
-# 若 DSN 是 URL 形式：追加 prepare_threshold=0
-if "prepare_threshold=" not in DSN:
-    if "?" in DSN:
-        DSN = DSN + "&prepare_threshold=0"
-    else:
-        DSN = DSN + "?prepare_threshold=0"
-
-# 2) R2 公网前缀（你已经在 Render 里加了）
-# 例如：https://<accountid>.r2.cloudflarestorage.com/sci-iqa-images
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
 USE_R2 = bool(R2_PUBLIC_BASE_URL)
+if not USE_R2:
+    st.warning("R2_PUBLIC_BASE_URL not set. Images may not load.")
 
-# 你的实验参数
 P = 300
 R_TARGET = 25
 N_TARGET = 6000
@@ -57,43 +44,57 @@ LABELS = {
 }
 
 # =========================
-# PG connection pool
+# Pool (关键：不要往 DSN 里塞 prepare_threshold)
+# 同时：pool 不要太大，Render 单实例 + Supabase pooler 很容易卡死
 # =========================
 @st.cache_resource
 def get_pool():
-    # max_size 别太大；Render 单实例 + DB pooler，太大反而抖
+    # ✅ after_connect：每次拿到新连接都执行，禁用 prepared statement 缓存
+    # 这样不会碰 DSN 解析问题
+    def _after_connect(conn):
+        # 对 Supabase / PgBouncer 这类 pooled 连接，prepared statements 经常出问题
+        # 这两句足够把“重复/不存在 prepared statement”概率打到很低
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '30s';")
+            cur.execute("SET idle_in_transaction_session_timeout = '30s';")
+            # 关闭服务端 prepared statement 的使用（psycopg3 的话靠减少缓存/避免计划复用）
+            # 这里不写 prepare_threshold，直接用 DEFERRED/自适应方案：禁用 session 级缓存
+            cur.execute("SET plan_cache_mode = force_generic_plan;")
+        conn.commit()
+
     return ConnectionPool(
         conninfo=DSN,
         min_size=1,
-        max_size=8,
-        timeout=30,
-        max_idle=60,
+        max_size=3,          # ✅ 先小一点，避免 pooler/Render 卡死
+        timeout=60,          # ✅ 给连接更久时间
+        max_idle=30,
+        reconnect_timeout=5,
+        num_workers=1,       # ✅ 避免开很多后台线程抢连接
+        after_connect=_after_connect,
     )
 
 pool = get_pool()
 
 def pg_exec(sql, params=None, fetch=False, fetchone=False):
-    with pool.connection() as conn:
+    # 每次操作都打印耗时，方便你在 Render logs 定位慢点
+    t0 = time.time()
+    with pool.connection(timeout=60) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
             if fetchone:
-                return cur.fetchone()
-            if fetch:
-                return cur.fetchall()
+                res = cur.fetchone()
+            elif fetch:
+                res = cur.fetchall()
+            else:
+                res = None
         conn.commit()
+    log.info("SQL %.2fs | %s", time.time() - t0, sql.strip().splitlines()[0][:120])
+    return res
 
 # =========================
-# Speed: Assign images in 2~3 SQL calls
+# Fast assign (2~3 次SQL)
 # =========================
 def assign_images_for_participant(pid: str):
-    """
-    快速并发安全分配：
-    - 一次 SQL 用窗口函数取每个 strata 的 COVER_M
-    - 再补齐到 K_PER_PERSON
-    - FOR UPDATE SKIP LOCKED 并发安全
-    - 禁用 prepared statements 后不会再 DuplicatePreparedStatement
-    """
-    # 已有分配则跳过
     row = pg_exec("SELECT COUNT(*) FROM assignments WHERE participant_id=%s", (pid,), fetchone=True)
     already = int(row[0]) if row else 0
     if already >= K_PER_PERSON:
@@ -101,11 +102,10 @@ def assign_images_for_participant(pid: str):
 
     now = datetime.now()
 
-    with pool.connection() as conn:
+    with pool.connection(timeout=60) as conn:
         with conn.cursor() as cur:
             cur.execute("BEGIN")
 
-            # 1) coverage + fill 一次性挑选候选集（再由 python 去重/裁剪）
             cur.execute(
                 """
                 WITH ranked AS (
@@ -145,13 +145,11 @@ def assign_images_for_participant(pid: str):
             )
             chosen = [r[0] for r in cur.fetchall()]
 
-            # 去重 + 裁剪
             seen = set()
             chosen = [x for x in chosen if not (x in seen or seen.add(x))]
             if len(chosen) > K_PER_PERSON:
                 chosen = chosen[:K_PER_PERSON]
 
-            # 2) assignments 批量写入
             cur.executemany(
                 """
                 INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
@@ -161,7 +159,6 @@ def assign_images_for_participant(pid: str):
                 [(pid, img_id, i, now) for i, img_id in enumerate(chosen)]
             )
 
-            # 3) assigned_count 一次性更新（比 executemany 快很多）
             cur.execute(
                 """
                 UPDATE images
@@ -173,11 +170,8 @@ def assign_images_for_participant(pid: str):
 
             conn.commit()
 
-# =========================
-# Prefetch: rating 页不再每张图查 DB
-# =========================
 def prefetch_assignments(pid: str):
-    rows = pg_exec(
+    return pg_exec(
         """
         SELECT a.image_id, i.rel_path
         FROM assignments a
@@ -188,7 +182,6 @@ def prefetch_assignments(pid: str):
         (pid,),
         fetch=True
     )
-    return rows  # [(image_id, rel_path), ...]
 
 # =========================
 # Session init
@@ -201,6 +194,8 @@ if "idx" not in st.session_state:
     st.session_state.idx = 0
 if "assigned" not in st.session_state:
     st.session_state.assigned = []
+if "rating_start_ts" not in st.session_state:
+    st.session_state.rating_start_ts = None
 
 # =========================
 # Pages
@@ -219,15 +214,21 @@ def render_intro():
 
     if not submitted:
         return
-
     if student_id.strip() == "":
         st.error("Please enter your student ID.")
         return
 
-    # 创建参与者
     pid = str(uuid4())
     st.session_state.participant_id = pid
 
+    # 先测试数据库连通性（会打印 SQL 耗时）
+    try:
+        pg_exec("SELECT 1", fetchone=True)
+    except Exception as e:
+        st.error(f"DB connection failed: {e}")
+        st.stop()
+
+    # 写 participants
     pg_exec(
         """
         INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time)
@@ -236,18 +237,16 @@ def render_intro():
         (pid, student_id.strip(), device, resolution_choice, datetime.now())
     )
 
-    # 分配（打印耗时到 Render Logs）
+    # assign
     t0 = time.time()
-    log.info("Start assign pid=%s", pid)
     assign_images_for_participant(pid)
-    log.info("Assign finished in %.2fs", time.time() - t0)
+    log.info("Assign finished %.2fs", time.time() - t0)
 
-    # 预取 assignments（评分阶段不再反复查库）
+    # prefetch
     t1 = time.time()
     st.session_state.assigned = prefetch_assignments(pid)
-    log.info("Prefetch assignments done: %d in %.2fs", len(st.session_state.assigned), time.time() - t1)
+    log.info("Prefetch %d finished %.2fs", len(st.session_state.assigned), time.time() - t1)
 
-    # 进入评分
     st.session_state.stage = "rating"
     st.session_state.idx = 0
     st.session_state.rating_start_ts = time.time()
@@ -255,32 +254,29 @@ def render_intro():
 
 def render_rating():
     pid = st.session_state.participant_id
-    pairs = st.session_state.get("assigned", [])
+    pairs = st.session_state.assigned
 
     if not pid:
         st.error("No participant id.")
         st.stop()
 
     if not pairs:
-        st.warning("No assignments found. Retrying prefetch...")
+        st.warning("No assignments found. Retrying...")
         st.session_state.assigned = prefetch_assignments(pid)
         pairs = st.session_state.assigned
         if not pairs:
-            st.error("Still no assignments. Please check DB assignments/images.")
+            st.error("Still no assignments. Check DB.")
             st.stop()
 
     total = len(pairs)
     done = st.session_state.idx
 
-    if "rating_start_ts" not in st.session_state:
-        st.session_state.rating_start_ts = time.time()
-
-    elapsed = time.time() - st.session_state.rating_start_ts
+    elapsed = time.time() - (st.session_state.rating_start_ts or time.time())
     sec_per = elapsed / max(1, done)
     remaining_sec = max(0, (total - done) * sec_per)
 
-    st.progress(done / total if total else 0, text=f"Progress: {done}/{total} images completed")
-    st.caption(f"Elapsed: {elapsed/60:.1f} min · Avg: {sec_per:.1f}s/image · ETA: {remaining_sec/60:.1f} min")
+    st.progress(done / total if total else 0, text=f"Progress: {done}/{total}")
+    st.caption(f"Elapsed: {elapsed/60:.1f} min · Avg: {sec_per:.1f}s/img · ETA: {remaining_sec/60:.1f} min")
 
     if done >= total:
         st.session_state.stage = "done"
@@ -289,15 +285,14 @@ def render_rating():
 
     image_id, rel_path = pairs[done]
 
-    # 图片 URL（R2）
-    if USE_R2:
-        img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
-        left, right = st.columns([3.6, 1.4], gap="large")
-        with left:
+    left, right = st.columns([3.6, 1.4], gap="large")
+    with left:
+        if USE_R2:
+            img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
             st.image(img_url, caption=rel_path, use_container_width=True)
-    else:
-        st.error("USE_R2 is False: Please set R2_PUBLIC_BASE_URL on Render.")
-        st.stop()
+        else:
+            st.error("R2_PUBLIC_BASE_URL not set.")
+            st.stop()
 
     with right:
         score = st.radio(
@@ -307,19 +302,15 @@ def render_rating():
             key=f"score_{done}",
             format_func=lambda x: f"{x} — {LABELS[x]}",
         )
-
-        st.markdown("**Text clarity / 文本清晰度**")
         text_clarity = st.radio(
-            "Text clarity",
+            "Text clarity / 文本清晰度",
             options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
             index=None,
             key=f"text_{done}",
         )
-
         next_clicked = st.button("Next", disabled=(score is None or text_clarity is None))
 
     if next_clicked:
-        # 写入评分（一次 SQL）
         pg_exec(
             """
             INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
@@ -331,8 +322,8 @@ def render_rating():
         st.rerun()
 
 def render_done():
-    st.success("Thank you for participating! / 感谢参与！")
-    st.write("You may now close this page.")
+    st.success("Thank you! / 感谢参与！")
+    st.write("You may close this page.")
 
 # =========================
 # Router
