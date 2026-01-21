@@ -7,7 +7,8 @@ from datetime import datetime
 import streamlit as st
 import psycopg
 from psycopg_pool import ConnectionPool
-from streamlit import components.v1 as components  # ✅ for components.html
+import streamlit.components.v1 as components
+
 
 # =========================
 # Logging
