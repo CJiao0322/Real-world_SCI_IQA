@@ -1,9 +1,15 @@
+# app_pg.py
+# -*- coding: utf-8 -*-
+
 import os
+import csv
 import time
 import random
-import csv
+import io
+import base64
 from datetime import datetime
 from uuid import uuid4
+from PIL import Image
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -12,22 +18,29 @@ from streamlit_js_eval import streamlit_js_eval
 import psycopg
 from psycopg_pool import ConnectionPool
 
-
 st.set_page_config(layout="wide")
 
-
 # =========================
-# Config
+# ENV / Config
 # =========================
 DSN = os.environ.get("DATABASE_URL", "").strip()
 if not DSN:
-    st.error("Missing env var: DATABASE_URL")
+    st.error("缺少环境变量 DATABASE_URL（Supabase PostgreSQL 连接串）")
     st.stop()
 
-R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").strip().rstrip("/")
+R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
 USE_R2 = bool(R2_PUBLIC_BASE_URL)
 
+# 训练图（你 GitHub 已经按这个放好了）
 TRAIN_DIR = "training_images"
+TRAIN_FILES = [
+    "01_bad.png",
+    "02_poor.png",
+    "03_fair.png",
+    "04_good.png",
+    "05_excellent.png",
+]
+
 TRAIN_INTERVAL_MS = 7000
 
 LABELS = {
@@ -35,112 +48,84 @@ LABELS = {
     2: "Poor（较差）— 明显失真，细节受损，文本不清晰",
     3: "Fair（一般）— 有一定失真，但仍可接受",
     4: "Good（良好）— 轻微失真，不影响正常观看",
-    5: "Excellent（优秀）— 几乎无失真，清晰自然"
+    5: "Excellent（优秀）— 几乎无失真，清晰自然",
 }
 
-
 # =========================
-# PG Pool (fast + safe)
+# DB Pool
 # =========================
 @st.cache_resource
 def get_pool():
-    # 注意：psycopg3 的 prepared statement 问题，我们不用任何 prepare_threshold 参数
-    return ConnectionPool(conninfo=DSN, min_size=1, max_size=20, timeout=30)
+    # 不在 DSN 里加 prepare_threshold 这种参数（你之前已经踩过坑）
+    return ConnectionPool(conninfo=DSN, min_size=1, max_size=10, timeout=30)
 
 pool = get_pool()
 
-
-def pg_exec(sql, params=None, fetch=False, fetchone=False):
+def pg_fetchall(sql, params=()):
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            if fetchone:
-                return cur.fetchone()
-            if fetch:
-                return cur.fetchall()
+            cur.execute(sql, params, prepare=False)
+            return cur.fetchall()
+
+def pg_fetchone(sql, params=()):
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params, prepare=False)
+            return cur.fetchone()
+
+def pg_exec(sql, params=()):
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params, prepare=False)
         conn.commit()
 
-
-# =========================
-# DB helpers (slot-based)
-# =========================
-@st.cache_data(ttl=60)
-def get_exp_config():
-    r = pg_exec(
-        "SELECT p_total, r_target, n_images, k_per_person FROM exp_config WHERE id=1",
-        fetchone=True
-    )
-    if not r:
-        return None
-    return {"P": int(r[0]), "R": int(r[1]), "N": int(r[2]), "K": int(r[3])}
-
-
-def get_next_slot_and_increment():
-    """
-    原子发号：slot_counter.next_slot 从 1 开始，取完 +1
-    如果超过 P，就循环回 1（你也可以改成“超过就停止”）
-    """
-    cfg = get_exp_config()
-    if not cfg:
-        raise RuntimeError("exp_config not found, please run make_assignment_plan_from_manifest.py")
-
-    P = cfg["P"]
-
+def init_db():
+    # 只做“确保存在/迁移”，不做清空（清空你已经在 plan 脚本里做了）
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("BEGIN")
-            # 锁住这行，保证并发安全
-            cur.execute("SELECT next_slot FROM slot_counter WHERE id=1 FOR UPDATE")
-            row = cur.fetchone()
-            if not row:
-                cur.execute("INSERT INTO slot_counter (id, next_slot) VALUES (1, 1)")
-                next_slot = 1
-            else:
-                next_slot = int(row[0])
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS participants (
+                participant_id TEXT PRIMARY KEY,
+                student_id TEXT,
+                device TEXT,
+                screen_resolution TEXT,
+                start_time TIMESTAMP,
+                slot INTEGER
+            );
+            """, prepare=False)
 
-            slot = next_slot
-            next_slot = next_slot + 1
-            if next_slot > P:
-                next_slot = 1
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS assignments (
+                participant_id TEXT NOT NULL,
+                image_id TEXT NOT NULL,
+                ord INTEGER NOT NULL,
+                assigned_time TIMESTAMP NOT NULL,
+                PRIMARY KEY (participant_id, image_id)
+            );
+            """, prepare=False)
 
-            cur.execute("UPDATE slot_counter SET next_slot=%s WHERE id=1", (next_slot,))
-            conn.commit()
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS ratings (
+                participant_id TEXT,
+                image_id TEXT,
+                image_name TEXT,
+                score INTEGER,
+                label TEXT,
+                time TIMESTAMP,
+                text_clarity TEXT
+            );
+            """, prepare=False)
 
-    return slot
+            # 你 plan 脚本里会建：images / assignment_plan / slot_counter / exp_config
+        conn.commit()
 
-
-def get_plan_image_ids_by_slot(slot: int):
-    rows = pg_exec(
-        "SELECT image_id FROM assignment_plan WHERE slot=%s ORDER BY ord ASC",
-        (slot,),
-        fetch=True
-    )
-    return [r[0] for r in rows]
-
-
-@st.cache_data(ttl=3600)
-def get_image_relpath(image_id: str):
-    r = pg_exec("SELECT rel_path FROM images WHERE image_id=%s", (image_id,), fetchone=True)
-    return r[0] if r else None
-
+init_db()
 
 # =========================
-# UI helpers
+# Helpers
 # =========================
 @st.cache_data(show_spinner=False)
-def list_images(folder):
-    exts = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")
-    if not os.path.exists(folder):
-        return []
-    return sorted([f for f in os.listdir(folder) if f.lower().endswith(exts) and not f.startswith(".")])
-
-
-@st.cache_data(show_spinner=False)
-def image_as_data_url(img_path: str, max_side: int, quality: int = 88) -> str:
-    # training 用，尽量快
-    from PIL import Image
-    import io, base64
-
+def image_as_data_url(img_path: str, max_side: int = 2400, quality: int = 88) -> str:
     with Image.open(img_path) as im:
         im = im.convert("RGB")
         im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
@@ -149,12 +134,87 @@ def image_as_data_url(img_path: str, max_side: int, quality: int = 88) -> str:
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
         return f"data:image/jpeg;base64,{b64}"
 
+def get_exp_config():
+    r = pg_fetchone("SELECT n_images, k_per_person, p_total, r_target FROM exp_config WHERE id=1")
+    if not r:
+        st.error("数据库缺少 exp_config（你需要先运行 make_assignment_plan_from_manifest.py 导入）")
+        st.stop()
+    n_images, k_per, p_total, r_target = r
+    return int(n_images), int(k_per), int(p_total), int(r_target)
 
-def img_url_from_relpath(rel_path: str) -> str:
-    # rel_path 里面可能有空格/特殊字符，保险起见 encode
-    from urllib.parse import quote
-    return f"{R2_PUBLIC_BASE_URL}/{quote(rel_path)}"
+def allocate_next_slot(p_total: int) -> int:
+    """
+    原子发号：slot_counter.next_slot 循环 1..P
+    返回“本次分配的 slot”
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE slot_counter
+                SET next_slot = (next_slot % %s) + 1
+                WHERE id=1
+                RETURNING CASE WHEN next_slot = 1 THEN %s ELSE next_slot - 1 END AS slot_assigned
+                """,
+                (p_total, p_total),
+                prepare=False
+            )
+            slot = cur.fetchone()[0]
+        conn.commit()
+    return int(slot)
 
+def get_plan_image_ids_for_slot(slot: int):
+    rows = pg_fetchall(
+        "SELECT image_id FROM assignment_plan WHERE slot=%s ORDER BY ord ASC",
+        (slot,)
+    )
+    return [r[0] for r in rows]
+
+def get_rel_path(image_id: str):
+    r = pg_fetchone("SELECT rel_path FROM images WHERE image_id=%s", (image_id,))
+    return r[0] if r else None
+
+def get_assigned_image_ids(pid: str):
+    rows = pg_fetchall(
+        "SELECT image_id FROM assignments WHERE participant_id=%s ORDER BY ord ASC",
+        (pid,)
+    )
+    return [r[0] for r in rows]
+
+def assign_images_for_participant(pid: str, slot: int):
+    """
+    关键：不再用 executemany，全部逐条 execute + prepare=False
+    => 彻底消灭 DuplicatePreparedStatement
+    """
+    # 如果已分配就不重复
+    exist = pg_fetchone(
+        "SELECT 1 FROM assignments WHERE participant_id=%s LIMIT 1",
+        (pid,)
+    )
+    if exist:
+        return
+
+    image_ids = get_plan_image_ids_for_slot(slot)
+    if not image_ids:
+        st.error(f"assignment_plan 里找不到 slot={slot} 的数据（请检查 plan 导入）")
+        st.stop()
+
+    now = datetime.now()
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            # 一条条插，绝对稳定
+            for ord_i, image_id in enumerate(image_ids):
+                cur.execute(
+                    """
+                    INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
+                    VALUES (%s,%s,%s,%s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (pid, image_id, ord_i, now),
+                    prepare=False
+                )
+        conn.commit()
 
 # =========================
 # Session State
@@ -165,11 +225,8 @@ if "participant_id" not in st.session_state:
     st.session_state.participant_id = None
 if "slot" not in st.session_state:
     st.session_state.slot = None
-if "assigned_ids" not in st.session_state:
-    st.session_state.assigned_ids = None
 if "idx" not in st.session_state:
     st.session_state.idx = 0
-
 
 # =========================
 # Pages
@@ -177,9 +234,8 @@ if "idx" not in st.session_state:
 def render_intro():
     st.title("Image Quality Assessment Experiment")
 
-    cfg = get_exp_config()
-    if cfg:
-        st.caption(f"Experiment config: N={cfg['N']} images · P={cfg['P']} slots · K={cfg['K']} per person · R={cfg['R']}")
+    n_images, k_per, p_total, r_target = get_exp_config()
+    st.caption(f"Experiment config: N={n_images}, K/person={k_per}, P={p_total}, R_target={r_target}")
 
     with st.form("intro_form"):
         student_id = st.text_input("Student ID / 学号", "")
@@ -211,7 +267,6 @@ def render_intro():
 
     if not submitted:
         return
-
     if student_id.strip() == "":
         st.error("Please enter your student ID.")
         return
@@ -223,49 +278,25 @@ def render_intro():
     else:
         screen_resolution = f"manual:{resolution_choice.replace('×','x')}"
 
-    # 1) 发一个 slot（并发安全）
-    slot = get_next_slot_and_increment()
-
-    # 2) participant_id
     pid = str(uuid4())
 
-    # 3) 写 participants
+    # 发 slot + 写 participant + 写 assignments
+    slot = allocate_next_slot(p_total)
+
     pg_exec(
         """
-        INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time)
-        VALUES (%s,%s,%s,%s,%s)
+        INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time, slot)
+        VALUES (%s,%s,%s,%s,%s,%s)
         """,
-        (pid, student_id.strip(), device, screen_resolution, datetime.now())
+        (pid, student_id.strip(), device, screen_resolution, datetime.now(), slot)
     )
 
-    # 4) 读取该 slot 的图片列表（一次拿完，存在 session，后续不再查计划表）
-    assigned_ids = get_plan_image_ids_by_slot(slot)
-    if not assigned_ids:
-        st.error(f"No images found for slot={slot}. Please check assignment_plan import.")
-        return
-
-    # 5) 写 assignments（可选，但建议保留：方便你后续查某人拿了哪些图）
-    now = datetime.now()
-    rows = [(pid, img_id, i, now) for i, img_id in enumerate(assigned_ids)]
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.executemany(
-                """
-                INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
-                VALUES (%s,%s,%s,%s)
-                ON CONFLICT DO NOTHING
-                """,
-                rows
-            )
-        conn.commit()
+    assign_images_for_participant(pid, slot)
 
     st.session_state.participant_id = pid
     st.session_state.slot = slot
-    st.session_state.assigned_ids = assigned_ids
-    st.session_state.idx = 0
     st.session_state.stage = "training"
     st.rerun()
-
 
 def render_training():
     st.markdown(
@@ -285,16 +316,21 @@ def render_training():
         unsafe_allow_html=True,
     )
 
-    train_imgs = list_images(TRAIN_DIR)
-    if len(train_imgs) < 5:
-        st.error(f"训练图目录 {TRAIN_DIR}/ 下至少需要 5 张图。当前：{len(train_imgs)}")
+    # 固定顺序：按 TRAIN_FILES
+    paths = [os.path.join(TRAIN_DIR, f) for f in TRAIN_FILES]
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        st.error("training_images 缺少文件：\n" + "\n".join(missing))
         st.stop()
 
-    # ✅ 确定性：固定取前 5 张（按文件名排序）
-    train_imgs = train_imgs[:5]
-
-    urls = [image_as_data_url(os.path.join(TRAIN_DIR, f), max_side=2400, quality=88) for f in train_imgs]
-    caps = [f"{i+1} — {LABELS[i+1]}" for i in range(5)]
+    urls = [image_as_data_url(p, max_side=2400, quality=88) for p in paths]
+    caps = [
+        f"1 — {LABELS[1]}",
+        f"2 — {LABELS[2]}",
+        f"3 — {LABELS[3]}",
+        f"4 — {LABELS[4]}",
+        f"5 — {LABELS[5]}",
+    ]
 
     components.html(
         f"""
@@ -353,17 +389,19 @@ def render_training():
         st.session_state.rating_start_ts = time.time()
         st.rerun()
 
-
 def render_rating():
     pid = st.session_state.participant_id
-    assigned_ids = st.session_state.assigned_ids
-
-    if not pid or not assigned_ids:
-        st.error("Session lost. Please restart from the homepage.")
+    if not pid:
+        st.error("No participant id.")
         st.stop()
 
+    assigned_ids = get_assigned_image_ids(pid)
     total = len(assigned_ids)
     done = st.session_state.idx
+
+    if total == 0:
+        st.error("该参与者 assignments 为空（可能 assign_images_for_participant 没执行成功）")
+        st.stop()
 
     if "rating_start_ts" not in st.session_state:
         st.session_state.rating_start_ts = time.time()
@@ -372,7 +410,7 @@ def render_rating():
     sec_per = elapsed / max(1, done)
     remaining_sec = max(0, (total - done) * sec_per)
 
-    st.progress(done / total if total else 0, text=f"Progress: {done}/{total} images completed")
+    st.progress(done / total, text=f"Progress: {done}/{total} images completed")
     st.caption(f"Elapsed: {elapsed/60:.1f} min · Avg: {sec_per:.1f}s/image · ETA: {remaining_sec/60:.1f} min")
 
     if done >= total:
@@ -381,18 +419,19 @@ def render_rating():
         return
 
     image_id = assigned_ids[done]
-    rel_path = get_image_relpath(image_id)
+    rel_path = get_rel_path(image_id)
     if not rel_path:
-        st.error("Image not found in DB.")
+        st.error(f"images 表里找不到 image_id={image_id}")
         st.stop()
 
     left, right = st.columns([3.6, 1.4], gap="large")
 
     with left:
         if USE_R2:
-            st.image(img_url_from_relpath(rel_path), caption=rel_path, use_container_width=True)
+            img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
+            st.image(img_url, caption=rel_path, use_container_width=True)
         else:
-            st.error("R2_PUBLIC_BASE_URL not set. Please set it in Render env.")
+            st.error("缺少 R2_PUBLIC_BASE_URL（现在是线上环境，必须走 R2）")
             st.stop()
 
     with right:
@@ -407,7 +446,6 @@ def render_rating():
             label_visibility="collapsed",
         )
 
-        st.markdown("---")
         st.markdown("**Text clarity / 文本清晰度**")
         text_clarity = st.radio(
             "",
@@ -420,6 +458,7 @@ def render_rating():
         next_clicked = st.button("Next", disabled=(score is None or text_clarity is None))
 
     if next_clicked:
+        # 单条 insert（prepare=False）稳定
         pg_exec(
             """
             INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
@@ -430,13 +469,9 @@ def render_rating():
         st.session_state.idx += 1
         st.rerun()
 
-
 def render_done():
-    if "rating_start_ts" in st.session_state:
-        del st.session_state["rating_start_ts"]
     st.success("Thank you for participating! / 感谢参与！")
     st.write("You may now close this page.")
-
 
 # =========================
 # Router
