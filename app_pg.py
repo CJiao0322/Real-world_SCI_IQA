@@ -1,5 +1,5 @@
-R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
-USE_R2 = bool(R2_PUBLIC_BASE_URL)
+# R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
+# USE_R2 = bool(R2_PUBLIC_BASE_URL)
 
 import os
 import streamlit as st
@@ -247,11 +247,43 @@ def render_intro():
     st.session_state.stage = "training"
     st.rerun()
 
+# def render_training():
+#     st.markdown(
+#         """
+#         <div style="text-align:center; font-weight:950; font-size:30px; margin-top:6px;">
+#           Training / 引导示例
+#         </div>
+#         """,
+#         unsafe_allow_html=True,
+#     )
+
+#     train_imgs = list_images(TRAIN_DIR)
+#     if len(train_imgs) < 5:
+#         st.error(f"训练图目录 {TRAIN_DIR}/ 下至少需要 5 张图。当前：{len(train_imgs)}")
+#         st.stop()
+
+#     st.info("培训页你现在用的是前端轮播（压缩JPEG），评分页显示原图。培训慢一点可调 TRAIN_INTERVAL_MS。")
+
+#     if st.button("Next → Start Rating"):
+#         st.session_state.stage = "rating"
+#         st.session_state.idx = 0
+#         st.session_state.rating_start_ts = time.time()
+#         st.rerun()
+
+
 def render_training():
     st.markdown(
         """
         <div style="text-align:center; font-weight:950; font-size:30px; margin-top:6px;">
           Training / 引导示例
+        </div>
+        <div style="text-align:center; opacity:0.85; font-weight:800; margin-top:10px; margin-bottom:12px; line-height:1.7;">
+          请观察图像整体质量，并理解不同评分等级的含义。<br/>
+          评分主要依据：清晰度、自然程度、以及是否存在明显失真（模糊、噪声、伪影、压缩痕迹、文本难以辨认等）。<br/>
+          <b>Bad / Poor</b>：失真明显，影响观看体验；<br/>
+          <b>Fair</b>：存在一定失真，但仍可接受；<br/>
+          <b>Good / Excellent</b>：图像清晰自然，几乎无明显失真。<br/>
+          以下示例仅用于帮助理解评分标准，不会记录分数。培训完请点击下方按钮开始打分。
         </div>
         """,
         unsafe_allow_html=True,
@@ -262,13 +294,68 @@ def render_training():
         st.error(f"训练图目录 {TRAIN_DIR}/ 下至少需要 5 张图。当前：{len(train_imgs)}")
         st.stop()
 
-    st.info("培训页你现在用的是前端轮播（压缩JPEG），评分页显示原图。培训慢一点可调 TRAIN_INTERVAL_MS。")
+    train_imgs = train_imgs[:5]
+    urls = [image_as_data_url(os.path.join(TRAIN_DIR, f), max_side=2400, quality=88) for f in train_imgs]
+    caps = [f"{i+1} — {LABELS[i+1]}" for i in range(5)]
 
+    components.html(
+        f"""
+        <div style="width:100%; display:flex; justify-content:center;">
+          <div style="width:min(1800px, 98vw); text-align:center;">
+            <img id="trainImg"
+                 style="
+                    width:100%;
+                    height:auto;
+                    max-height: 78vh;
+                    object-fit: contain;
+                    border-radius:18px;
+                    border:1px solid rgba(0,0,0,0.10);
+                    box-shadow:0 18px 48px rgba(0,0,0,0.18);
+                    background:#fff;
+                 " />
+            <div id="trainCap"
+                 style="margin-top:12px; font-size:22px; font-weight:950;"></div>
+            <div style="opacity:0.65; font-weight:800; font-size:13px; margin-top:6px;">
+              Training only · No scores recorded
+            </div>
+          </div>
+        </div>
+
+        <script>
+          const urls = {urls};
+          const caps = {caps};
+          const interval = {TRAIN_INTERVAL_MS};
+
+          const img = document.getElementById("trainImg");
+          const cap = document.getElementById("trainCap");
+
+          let i = 0;
+          function show() {{
+            img.src = urls[i];
+            cap.textContent = caps[i];
+          }}
+
+          show();
+
+          setTimeout(() => {{
+            setInterval(() => {{
+              i = (i + 1) % urls.length;
+              show();
+            }}, interval);
+          }}, 700);
+        </script>
+        """,
+        height=760,
+    )
+
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
     if st.button("Next → Start Rating"):
         st.session_state.stage = "rating"
         st.session_state.idx = 0
         st.session_state.rating_start_ts = time.time()
         st.rerun()
+
+
 
 def render_rating():
     pid = st.session_state.participant_id
