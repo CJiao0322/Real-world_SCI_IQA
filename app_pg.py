@@ -378,22 +378,7 @@ def render_training():
         unsafe_allow_html=True,
     )
 
-    # ✅ 固定顺序（确定性）
-    files = TRAIN_FILES  # ["01_bad.png", ...]
-    local_paths = [os.path.join(TRAIN_DIR, f) for f in files]
-
-    # 训练图片来源：优先本地，其次 R2（同路径 training_images/...）
-    use_local = all(os.path.exists(p) for p in local_paths)
-
-    if (not use_local) and (not USE_R2):
-        st.error(
-            "training_images 在服务器上不存在，同时也没配置 R2_PUBLIC_BASE_URL。\n"
-            "解决方案：\n"
-            "1) 把 training_images/ 提交到 GitHub 并确保 Render 能拿到；或\n"
-            "2) 把 training_images/ 上传到 R2，并设置环境变量 R2_PUBLIC_BASE_URL。"
-        )
-        st.stop()
-
+    # 训练图片说明
     caps = [
         f"1 — {LABELS[1]}",
         f"2 — {LABELS[2]}",
@@ -402,32 +387,60 @@ def render_training():
         f"5 — {LABELS[5]}",
     ]
 
-    # ✅ 训练阶段不要自动轮播（轮播为了“快”通常要缩放/重编码，反而糊）
-    # 改为：用户点按钮切换，显示“原图”
+    # ✅ 强制走 R2（浏览器直连拉图，速度/缓存最好）
+    if not USE_R2:
+        st.error("Training 阶段已改为从 R2 拉图，但你没有设置 R2_PUBLIC_BASE_URL。")
+        st.stop()
+
+    # session state
     if "train_idx" not in st.session_state:
         st.session_state.train_idx = 0
 
+    # 左右按钮
     colA, colB, colC = st.columns([1, 6, 1], vertical_alignment="center")
     with colA:
         if st.button("← Prev", use_container_width=True):
-            st.session_state.train_idx = (st.session_state.train_idx - 1) % len(files)
+            st.session_state.train_idx = (st.session_state.train_idx - 1) % len(TRAIN_FILES)
             st.rerun()
 
     with colC:
         if st.button("Next →", use_container_width=True):
-            st.session_state.train_idx = (st.session_state.train_idx + 1) % len(files)
+            st.session_state.train_idx = (st.session_state.train_idx + 1) % len(TRAIN_FILES)
             st.rerun()
 
     idx = st.session_state.train_idx
-    st.markdown(f"<div style='text-align:center; font-size:22px; font-weight:950;'>{caps[idx]}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div style='text-align:center; font-size:22px; font-weight:950;'>{caps[idx]}</div>",
+        unsafe_allow_html=True
+    )
 
-    # ✅ 显示“原图”，不做 JPEG、不做 thumbnail
-    if use_local:
-        st.image(local_paths[idx], output_format="PNG")
-    else:
-        # R2 上也保持路径 training_images/xx.png
-        url = f"{R2_PUBLIC_BASE_URL}/{TRAIN_DIR}/{files[idx]}"
-        st.image(url, use_container_width=True)
+    # ✅ 直接给浏览器一个 URL：不经 Streamlit/PIL 转码，不会“变糊”，且可走 CDN 缓存
+    base = f"{R2_PUBLIC_BASE_URL}/{TRAIN_DIR}"
+    cur_url  = f"{base}/{TRAIN_FILES[idx]}"
+    next_url = f"{base}/{TRAIN_FILES[(idx + 1) % len(TRAIN_FILES)]}"
+    prev_url = f"{base}/{TRAIN_FILES[(idx - 1) % len(TRAIN_FILES)]}"
+
+    # ✅ 用 components.html + <img>，完全绕开 st.image 的“中间处理”
+    # ✅ 预加载前后两张，翻页更快
+    components.html(
+        f"""
+        <head>
+          <link rel="preload" as="image" href="{next_url}">
+          <link rel="preload" as="image" href="{prev_url}">
+        </head>
+        <div style="width:100%; height:78vh; overflow:auto; border:1px solid #eee; border-radius:8px;">
+          <img src="{cur_url}"
+               style="display:block; max-width:none; height:auto;"
+               decoding="async"
+               loading="eager"
+          />
+        </div>
+        <div style="font-size:12px; opacity:0.7; margin-top:6px;">
+          Source: {cur_url}
+        </div>
+        """,
+        height=820,
+    )
 
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
@@ -435,7 +448,6 @@ def render_training():
         st.session_state.stage = "rating"
         st.session_state.idx = 0
         st.session_state.rating_start_ts = time.time()
-        # 清掉训练 idx
         if "train_idx" in st.session_state:
             del st.session_state["train_idx"]
         st.rerun()
