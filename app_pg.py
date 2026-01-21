@@ -6,7 +6,7 @@ import streamlit as st
 # 其他 import …
 
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
-
+USE_R2 = bool(R2_PUBLIC_BASE_URL)
 
 import streamlit as st
 import os
@@ -57,11 +57,26 @@ COVER_M = 2
 # =========================
 # PG connection pool
 # =========================
+# @st.cache_resource
+# def get_pool():
+#     return ConnectionPool(conninfo=DSN, min_size=1, max_size=20, timeout=30)
+
+# pool = get_pool()
+
 @st.cache_resource
 def get_pool():
-    return ConnectionPool(conninfo=DSN, min_size=1, max_size=20, timeout=30)
+    return ConnectionPool(
+        conninfo=DSN,
+        min_size=1,
+        max_size=20,
+        timeout=30,
+        kwargs={
+            "prepare_threshold": 0,  # ✅ 禁用 prepared statements，解决 _pg3_0 already exists
+        },
+    )
 
 pool = get_pool()
+
 
 def pg_exec(sql, params=None, fetch=False, fetchone=False):
     with pool.connection() as conn:
@@ -247,6 +262,18 @@ def render_intro():
     st.session_state.stage = "training"
     st.rerun()
 
+
+def image_as_data_url(img_path: str, max_side: int, quality: int = 92) -> str:
+    """Training 页：编码成 data URL 做轮播（避免 rerun），这里会压缩成 JPEG"""
+    with Image.open(img_path) as im:
+        im = im.convert("RGB")
+        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+
+
 # def render_training():
 #     st.markdown(
 #         """
@@ -388,10 +415,20 @@ def render_rating():
         st.error("Image not found in DB.")
         st.stop()
 
-    img_path = os.path.join(DATASET_ROOT, rel_path)
-    if not os.path.exists(img_path):
-        st.error(f"找不到图片：{img_path}")
-        st.stop()
+    # img_path = os.path.join(DATASET_ROOT, rel_path)
+    # if not os.path.exists(img_path):
+    #     st.error(f"找不到图片：{img_path}")
+    #     st.stop()
+
+    if USE_R2:
+        img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
+    else:
+        img_path = os.path.join(DATASET_ROOT, rel_path)
+        if not os.path.exists(img_path):
+            st.error(f"找不到图片：{img_path}")
+            st.stop()
+
+    
 
     left, right = st.columns([3.6, 1.4], gap="large")
     # with left:
