@@ -63,6 +63,20 @@ COVER_M = 2
 
 # pool = get_pool()
 
+# @st.cache_resource
+# def get_pool():
+#     return ConnectionPool(
+#         conninfo=DSN,
+#         min_size=1,
+#         max_size=20,
+#         timeout=30,
+#         kwargs={
+#             "prepare_threshold": 0,  # ✅ 禁用 prepared statements，解决 _pg3_0 already exists
+#         },
+#     )
+
+from psycopg_pool import ConnectionPool
+
 @st.cache_resource
 def get_pool():
     return ConnectionPool(
@@ -71,9 +85,12 @@ def get_pool():
         max_size=20,
         timeout=30,
         kwargs={
-            "prepare_threshold": 0,  # ✅ 禁用 prepared statements，解决 _pg3_0 already exists
+            "prepared_threshold": None,  # ✅ 关键：禁用 prepared statements（兼容 pgbouncer）
         },
     )
+
+pool = get_pool()
+
 
 pool = get_pool()
 
