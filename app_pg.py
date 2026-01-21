@@ -149,10 +149,11 @@ def allocate_next_slot(p_total: int) -> int:
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            # 注意：SQL 里的取模运算符 % 必须写成 %% ，否则 psycopg 会当成占位符解析
             cur.execute(
-                f"""
+                """
                 UPDATE slot_counter
-                SET next_slot = (next_slot % %s) + 1
+                SET next_slot = (next_slot %% %s) + 1
                 WHERE id=1
                 RETURNING CASE WHEN next_slot = 1 THEN %s ELSE next_slot - 1 END AS slot_assigned
                 """,
@@ -162,6 +163,7 @@ def allocate_next_slot(p_total: int) -> int:
             slot = cur.fetchone()[0]
         conn.commit()
     return int(slot)
+
 
 def get_plan_image_ids_for_slot(slot: int):
     rows = pg_fetchall(
