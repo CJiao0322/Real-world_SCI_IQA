@@ -1,3 +1,7 @@
+R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
+USE_R2 = bool(R2_PUBLIC_BASE_URL)
+
+
 import streamlit as st
 import os
 import csv
@@ -297,8 +301,16 @@ def render_rating():
         st.stop()
 
     left, right = st.columns([3.6, 1.4], gap="large")
-    with left:
+    # with left:
+    #     st.image(img_path, caption=rel_path, use_container_width=True)
+
+    if USE_R2:
+        img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
+        st.image(img_url, caption=rel_path, use_container_width=True)
+    else:
+        img_path = os.path.join(DATASET_ROOT, rel_path)
         st.image(img_path, caption=rel_path, use_container_width=True)
+
 
     with right:
         score = st.radio(
