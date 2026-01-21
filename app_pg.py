@@ -372,16 +372,26 @@ def render_training():
           <b>Bad / Poor</b>：失真明显，影响观看体验；<br/>
           <b>Fair</b>：存在一定失真，但仍可接受；<br/>
           <b>Good / Excellent</b>：图像清晰自然，几乎无明显失真。<br/>
-          以下示例仅用于帮助理解评分标准，不会记录分数。
+          以下示例仅用于帮助理解评分标准，不会记录分数。培训完请点击下方按钮开始打分。
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    paths = [os.path.join(TRAIN_DIR, f) for f in TRAIN_FILES]
-    missing = [p for p in paths if not os.path.exists(p)]
-    if missing:
-        st.error("training_images 缺少文件：\n" + "\n".join(missing))
+    # ✅ 固定顺序（确定性）
+    files = TRAIN_FILES  # ["01_bad.png", ...]
+    local_paths = [os.path.join(TRAIN_DIR, f) for f in files]
+
+    # 训练图片来源：优先本地，其次 R2（同路径 training_images/...）
+    use_local = all(os.path.exists(p) for p in local_paths)
+
+    if (not use_local) and (not USE_R2):
+        st.error(
+            "training_images 在服务器上不存在，同时也没配置 R2_PUBLIC_BASE_URL。\n"
+            "解决方案：\n"
+            "1) 把 training_images/ 提交到 GitHub 并确保 Render 能拿到；或\n"
+            "2) 把 training_images/ 上传到 R2，并设置环境变量 R2_PUBLIC_BASE_URL。"
+        )
         st.stop()
 
     caps = [
@@ -392,42 +402,44 @@ def render_training():
         f"5 — {LABELS[5]}",
     ]
 
-    idx = st.session_state.get("train_idx", 0)
+    # ✅ 训练阶段不要自动轮播（轮播为了“快”通常要缩放/重编码，反而糊）
+    # 改为：用户点按钮切换，显示“原图”
+    if "train_idx" not in st.session_state:
+        st.session_state.train_idx = 0
 
-    # st.image(
-    #     paths[idx],
-    #     caption=caps[idx],
-    #     use_container_width=True,
-    # )
-    st.image(
-    paths[idx],
-    caption=caps[idx],
-    use_container_width=False,   # ✅ 不强行拉伸
-    output_format="PNG",         # ✅ 强制不转 JPEG
-)    
-    # w = st.slider("Zoom (px width)", 800, 2400, 1600, step=100)
-    # st.image(paths[idx], caption=caps[idx], width=w, output_format="PNG")
-
-
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        if st.button("⬅ Previous", disabled=(idx == 0)):
-            st.session_state.train_idx = idx - 1
+    colA, colB, colC = st.columns([1, 6, 1], vertical_alignment="center")
+    with colA:
+        if st.button("← Prev", use_container_width=True):
+            st.session_state.train_idx = (st.session_state.train_idx - 1) % len(files)
             st.rerun()
 
-    with col2:
-        if idx < len(paths) - 1:
-            if st.button("Next ➡"):
-                st.session_state.train_idx = idx + 1
-                st.rerun()
-        else:
-            if st.button("Start Rating"):
-                st.session_state.pop("train_idx", None)
-                st.session_state.stage = "rating"
-                st.session_state.idx = 0
-                st.session_state.rating_start_ts = time.time()
-                st.rerun()
+    with colC:
+        if st.button("Next →", use_container_width=True):
+            st.session_state.train_idx = (st.session_state.train_idx + 1) % len(files)
+            st.rerun()
+
+    idx = st.session_state.train_idx
+    st.markdown(f"<div style='text-align:center; font-size:22px; font-weight:950;'>{caps[idx]}</div>", unsafe_allow_html=True)
+
+    # ✅ 显示“原图”，不做 JPEG、不做 thumbnail
+    if use_local:
+        st.image(local_paths[idx], use_container_width=True, output_format="PNG")
+    else:
+        # R2 上也保持路径 training_images/xx.png
+        url = f"{R2_PUBLIC_BASE_URL}/{TRAIN_DIR}/{files[idx]}"
+        st.image(url, use_container_width=True)
+
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+
+    if st.button("Next → Start Rating"):
+        st.session_state.stage = "rating"
+        st.session_state.idx = 0
+        st.session_state.rating_start_ts = time.time()
+        # 清掉训练 idx
+        if "train_idx" in st.session_state:
+            del st.session_state["train_idx"]
+        st.rerun()
+
 
 def render_rating():
     pid = st.session_state.participant_id
