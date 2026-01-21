@@ -441,25 +441,54 @@ def render_training():
     #     """,
     #     height=410,
     # )
+#     components.html(
+#     f"""
+#     <div style="
+#         width:100%;
+#         height:78vh;
+#         overflow:auto;
+#         border:1px solid #eee;
+#         border-radius:8px;
+#         display:flex;
+#         justify-content:center;
+#         align-items:flex-start;
+#         background:#fafafa;
+#     ">
+#       <img src="{cur_url}"
+#            style="
+#              max-width:1600px;   /* 👈 关键：限制最大显示宽度 */
+#              width:100%;
+#              height:auto;
+#              object-fit:contain;
+#              image-rendering:auto;
+#            "
+#            decoding="async"
+#            loading="eager"
+#       />
+#     </div>
+#     """,
+#     height=820,
+# )
     components.html(
     f"""
     <div style="
         width:100%;
-        height:78vh;
-        overflow:auto;
+        height:78vh;                 /* 固定展示高度 */
         border:1px solid #eee;
         border-radius:8px;
         display:flex;
         justify-content:center;
-        align-items:flex-start;
+        align-items:center;
         background:#fafafa;
+        overflow:hidden;             /* 👈 禁止滚动 */
     ">
       <img src="{cur_url}"
            style="
-             max-width:1600px;   /* 👈 关键：限制最大显示宽度 */
-             width:100%;
+             max-width:1600px;        /* 限制最大宽度 */
+             max-height:100%;         /* 👈 高度受容器约束 */
+             width:auto;
              height:auto;
-             object-fit:contain;
+             object-fit:contain;      /* 等比例缩放 */
              image-rendering:auto;
            "
            decoding="async"
@@ -469,6 +498,7 @@ def render_training():
     """,
     height=820,
 )
+
 
 
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
