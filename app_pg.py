@@ -40,7 +40,7 @@ TRAIN_FILES = [
     "4good.png",
     "5excellent.png",
 ]
-TRAIN_INTERVAL_MS = 7000
+TRAIN_INTERVAL_MS = 3500
 
 LABELS = {
     1: "Bad（差）— 严重失真，如明显模糊、强噪声、文本难以辨认",
@@ -439,7 +439,7 @@ def render_training():
     #       Source: {cur_url}
     #     </div>
     #     """,
-    #     height=820,
+    #     height=410,
     # )
     components.html(
     f"""
