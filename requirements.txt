@@ -1,0 +1,4 @@
+streamlit==1.52.2
+psycopg[binary]
+Pillow
+streamlit_js_eval
