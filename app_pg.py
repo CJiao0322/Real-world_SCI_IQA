@@ -1,11 +1,11 @@
 import os
 import time
-import random
 import logging
 from uuid import uuid4
 from datetime import datetime
 
 import streamlit as st
+import psycopg
 from psycopg_pool import ConnectionPool
 
 # =========================
@@ -27,7 +27,7 @@ if not DSN:
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
 USE_R2 = bool(R2_PUBLIC_BASE_URL)
 if not USE_R2:
-    st.warning("R2_PUBLIC_BASE_URL not set. Images may not load.")
+    st.warning("R2_PUBLIC_BASE_URL not set. Images may not load from R2.")
 
 P = 300
 R_TARGET = 25
@@ -44,41 +44,47 @@ LABELS = {
 }
 
 # =========================
-# Pool (关键：不要往 DSN 里塞 prepare_threshold)
-# 同时：pool 不要太大，Render 单实例 + Supabase pooler 很容易卡死
+# Pool  (保守，避免 Render + Supabase pooler 卡死)
 # =========================
 @st.cache_resource
 def get_pool():
-    # ✅ after_connect：每次拿到新连接都执行，禁用 prepared statement 缓存
-    # 这样不会碰 DSN 解析问题
-    def _after_connect(conn):
-        # 对 Supabase / PgBouncer 这类 pooled 连接，prepared statements 经常出问题
-        # 这两句足够把“重复/不存在 prepared statement”概率打到很低
-        with conn.cursor() as cur:
-            cur.execute("SET statement_timeout = '30s';")
-            cur.execute("SET idle_in_transaction_session_timeout = '30s';")
-            # 关闭服务端 prepared statement 的使用（psycopg3 的话靠减少缓存/避免计划复用）
-            # 这里不写 prepare_threshold，直接用 DEFERRED/自适应方案：禁用 session 级缓存
-            cur.execute("SET plan_cache_mode = force_generic_plan;")
-        conn.commit()
-
     return ConnectionPool(
         conninfo=DSN,
         min_size=1,
-        max_size=3,          # ✅ 先小一点，避免 pooler/Render 卡死
-        timeout=60,          # ✅ 给连接更久时间
-        max_idle=30,
-        reconnect_timeout=5,
-        num_workers=1,       # ✅ 避免开很多后台线程抢连接
-        after_connect=_after_connect,
+        max_size=3,      # ✅ 小一点更稳，避免 pooler 抽风
+        timeout=60,
     )
 
 pool = get_pool()
 
+# =========================
+# Connection init per-use  ✅关键：每次拿到连接就跑一下初始化SQL
+# 不需要 after_connect，也不需要往 DSN 里加 prepare_threshold
+# =========================
+INIT_SQL = """
+SET statement_timeout = '30s';
+SET idle_in_transaction_session_timeout = '30s';
+SET plan_cache_mode = force_generic_plan;
+"""
+
+def _init_conn(conn):
+    # 每次从池子拿到 conn，轻量初始化（几毫秒）
+    try:
+        with conn.cursor() as cur:
+            cur.execute(INIT_SQL)
+        conn.commit()
+    except Exception:
+        # 初始化失败也别让连接挂住
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
 def pg_exec(sql, params=None, fetch=False, fetchone=False):
-    # 每次操作都打印耗时，方便你在 Render logs 定位慢点
     t0 = time.time()
     with pool.connection(timeout=60) as conn:
+        _init_conn(conn)  # ✅ 在这里做 init
+
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
             if fetchone:
@@ -87,12 +93,14 @@ def pg_exec(sql, params=None, fetch=False, fetchone=False):
                 res = cur.fetchall()
             else:
                 res = None
+
         conn.commit()
+
     log.info("SQL %.2fs | %s", time.time() - t0, sql.strip().splitlines()[0][:120])
     return res
 
 # =========================
-# Fast assign (2~3 次SQL)
+# Assignment: 一次性 join 取 rel_path，避免 rating 页面每张图查DB
 # =========================
 def assign_images_for_participant(pid: str):
     row = pg_exec("SELECT COUNT(*) FROM assignments WHERE participant_id=%s", (pid,), fetchone=True)
@@ -103,9 +111,11 @@ def assign_images_for_participant(pid: str):
     now = datetime.now()
 
     with pool.connection(timeout=60) as conn:
+        _init_conn(conn)
         with conn.cursor() as cur:
             cur.execute("BEGIN")
 
+            # ✅ 用窗口函数做 coverage + fill，SQL 数量很少
             cur.execute(
                 """
                 WITH ranked AS (
@@ -119,9 +129,7 @@ def assign_images_for_participant(pid: str):
                   WHERE assigned_count < %s
                 ),
                 coverage AS (
-                  SELECT image_id
-                  FROM ranked
-                  WHERE rn <= %s
+                  SELECT image_id FROM ranked WHERE rn <= %s
                 ),
                 fill AS (
                   SELECT image_id
@@ -145,11 +153,13 @@ def assign_images_for_participant(pid: str):
             )
             chosen = [r[0] for r in cur.fetchall()]
 
+            # 去重 + 截断
             seen = set()
             chosen = [x for x in chosen if not (x in seen or seen.add(x))]
             if len(chosen) > K_PER_PERSON:
                 chosen = chosen[:K_PER_PERSON]
 
+            # 写入 assignments
             cur.executemany(
                 """
                 INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
@@ -159,12 +169,9 @@ def assign_images_for_participant(pid: str):
                 [(pid, img_id, i, now) for i, img_id in enumerate(chosen)]
             )
 
+            # 更新 assigned_count
             cur.execute(
-                """
-                UPDATE images
-                SET assigned_count = assigned_count + 1
-                WHERE image_id = ANY(%s)
-                """,
+                "UPDATE images SET assigned_count = assigned_count + 1 WHERE image_id = ANY(%s)",
                 (chosen,)
             )
 
@@ -221,7 +228,7 @@ def render_intro():
     pid = str(uuid4())
     st.session_state.participant_id = pid
 
-    # 先测试数据库连通性（会打印 SQL 耗时）
+    # ✅ 先测连接（日志里会显示耗时）
     try:
         pg_exec("SELECT 1", fetchone=True)
     except Exception as e:
@@ -237,12 +244,11 @@ def render_intro():
         (pid, student_id.strip(), device, resolution_choice, datetime.now())
     )
 
-    # assign
+    # assign + prefetch
     t0 = time.time()
     assign_images_for_participant(pid)
     log.info("Assign finished %.2fs", time.time() - t0)
 
-    # prefetch
     t1 = time.time()
     st.session_state.assigned = prefetch_assignments(pid)
     log.info("Prefetch %d finished %.2fs", len(st.session_state.assigned), time.time() - t1)
@@ -288,8 +294,7 @@ def render_rating():
     left, right = st.columns([3.6, 1.4], gap="large")
     with left:
         if USE_R2:
-            img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
-            st.image(img_url, caption=rel_path, use_container_width=True)
+            st.image(f"{R2_PUBLIC_BASE_URL}/{rel_path}", caption=rel_path, use_container_width=True)
         else:
             st.error("R2_PUBLIC_BASE_URL not set.")
             st.stop()
@@ -308,6 +313,7 @@ def render_rating():
             index=None,
             key=f"text_{done}",
         )
+
         next_clicked = st.button("Next", disabled=(score is None or text_clarity is None))
 
     if next_clicked:
