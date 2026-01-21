@@ -40,7 +40,6 @@ TRAIN_FILES = [
     "04_good.png",
     "05_excellent.png",
 ]
-
 TRAIN_INTERVAL_MS = 7000
 
 LABELS = {
@@ -56,7 +55,7 @@ LABELS = {
 # =========================
 @st.cache_resource
 def get_pool():
-    # 不在 DSN 里加 prepare_threshold 这种参数（你之前已经踩过坑）
+    # 不要往 DSN 里塞 prepare_threshold 等参数（你已经踩过坑）
     return ConnectionPool(conninfo=DSN, min_size=1, max_size=10, timeout=30)
 
 pool = get_pool()
@@ -79,10 +78,15 @@ def pg_exec(sql, params=()):
             cur.execute(sql, params, prepare=False)
         conn.commit()
 
-def init_db():
-    # 只做“确保存在/迁移”，不做清空（清空你已经在 plan 脚本里做了）
+def ensure_schema():
+    """
+    ✅ 只做“确保存在/迁移”，不做清空
+    - 关键：给旧 participants 自动补 slot 列（否则你一定会遇到 UndefinedColumn）
+    - 确保 slot_counter / exp_config 存在
+    """
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            # participants（包含 slot）
             cur.execute("""
             CREATE TABLE IF NOT EXISTS participants (
                 participant_id TEXT PRIMARY KEY,
@@ -94,6 +98,7 @@ def init_db():
             );
             """, prepare=False)
 
+            # assignments
             cur.execute("""
             CREATE TABLE IF NOT EXISTS assignments (
                 participant_id TEXT NOT NULL,
@@ -104,6 +109,7 @@ def init_db():
             );
             """, prepare=False)
 
+            # ratings
             cur.execute("""
             CREATE TABLE IF NOT EXISTS ratings (
                 participant_id TEXT,
@@ -116,10 +122,46 @@ def init_db():
             );
             """, prepare=False)
 
-            # 你 plan 脚本里会建：images / assignment_plan / slot_counter / exp_config
+            # 这些一般由你的 plan 脚本创建/导入，但这里兜底一下（不影响已有数据）
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS slot_counter (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                next_slot INTEGER NOT NULL
+            );
+            """, prepare=False)
+            cur.execute("""
+            INSERT INTO slot_counter (id, next_slot)
+            VALUES (1, 1)
+            ON CONFLICT (id) DO NOTHING;
+            """, prepare=False)
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS exp_config (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                p_total INTEGER NOT NULL,
+                r_target INTEGER NOT NULL,
+                n_images INTEGER NOT NULL,
+                k_per_person INTEGER NOT NULL,
+                updated_at TIMESTAMP NOT NULL
+            );
+            """, prepare=False)
+
+            # ✅ 自动迁移：如果旧 participants 没有 slot，就补上
+            cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='participants' AND column_name='slot'
+                ) THEN
+                    ALTER TABLE participants ADD COLUMN slot INTEGER;
+                END IF;
+            END $$;
+            """, prepare=False)
+
         conn.commit()
 
-init_db()
+ensure_schema()
 
 # =========================
 # Helpers
@@ -144,26 +186,43 @@ def get_exp_config():
 
 def allocate_next_slot(p_total: int) -> int:
     """
-    原子发号：slot_counter.next_slot 循环 1..P
-    返回“本次分配的 slot”
+    ✅ 原子发号（强一致，不卡）
+    - 取出当前 next_slot（就是本次分配给用户的 slot）
+    - 然后把 next_slot 更新为下一位（循环 1..P）
+    - 用 FOR UPDATE 锁定这一行，避免并发冲突
     """
+    if p_total <= 0:
+        raise ValueError("p_total must be > 0")
+
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            # 注意：SQL 里的取模运算符 % 必须写成 %% ，否则 psycopg 会当成占位符解析
             cur.execute(
                 """
-                UPDATE slot_counter
-                SET next_slot = (next_slot %% %s) + 1
-                WHERE id=1
-                RETURNING CASE WHEN next_slot = 1 THEN %s ELSE next_slot - 1 END AS slot_assigned
+                WITH s AS (
+                    SELECT next_slot
+                    FROM slot_counter
+                    WHERE id=1
+                    FOR UPDATE
+                ),
+                u AS (
+                    UPDATE slot_counter
+                    SET next_slot = (s.next_slot %% %s) + 1
+                    FROM s
+                    WHERE id=1
+                    RETURNING s.next_slot AS slot_assigned
+                )
+                SELECT slot_assigned FROM u;
                 """,
-                (p_total, p_total),
+                (p_total,),
                 prepare=False
             )
-            slot = cur.fetchone()[0]
+            row = cur.fetchone()
         conn.commit()
-    return int(slot)
 
+    if not row or row[0] is None:
+        # 极端情况兜底
+        return 1
+    return int(row[0])
 
 def get_plan_image_ids_for_slot(slot: int):
     rows = pg_fetchall(
@@ -185,10 +244,9 @@ def get_assigned_image_ids(pid: str):
 
 def assign_images_for_participant(pid: str, slot: int):
     """
-    关键：不再用 executemany，全部逐条 execute + prepare=False
-    => 彻底消灭 DuplicatePreparedStatement
+    ✅ 不用 executemany（避免 prepared statement 冲突）
+    ✅ 全部 prepare=False
     """
-    # 如果已分配就不重复
     exist = pg_fetchone(
         "SELECT 1 FROM assignments WHERE participant_id=%s LIMIT 1",
         (pid,)
@@ -202,10 +260,8 @@ def assign_images_for_participant(pid: str, slot: int):
         st.stop()
 
     now = datetime.now()
-
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            # 一条条插，绝对稳定
             for ord_i, image_id in enumerate(image_ids):
                 cur.execute(
                     """
@@ -282,9 +338,10 @@ def render_intro():
 
     pid = str(uuid4())
 
-    # 发 slot + 写 participant + 写 assignments
+    # ✅ 原子发 slot
     slot = allocate_next_slot(p_total)
 
+    # 写 participants（包含 slot）
     pg_exec(
         """
         INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time, slot)
@@ -293,6 +350,7 @@ def render_intro():
         (pid, student_id.strip(), device, screen_resolution, datetime.now(), slot)
     )
 
+    # 写 assignments（来自 assignment_plan）
     assign_images_for_participant(pid, slot)
 
     st.session_state.participant_id = pid
@@ -318,7 +376,7 @@ def render_training():
         unsafe_allow_html=True,
     )
 
-    # 固定顺序：按 TRAIN_FILES
+    # ✅ 固定顺序：按 TRAIN_FILES
     paths = [os.path.join(TRAIN_DIR, f) for f in TRAIN_FILES]
     missing = [p for p in paths if not os.path.exists(p)]
     if missing:
@@ -433,7 +491,7 @@ def render_rating():
             img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
             st.image(img_url, caption=rel_path, use_container_width=True)
         else:
-            st.error("缺少 R2_PUBLIC_BASE_URL（现在是线上环境，必须走 R2）")
+            st.error("缺少 R2_PUBLIC_BASE_URL（线上必须走 R2）")
             st.stop()
 
     with right:
@@ -460,7 +518,6 @@ def render_rating():
         next_clicked = st.button("Next", disabled=(score is None or text_clarity is None))
 
     if next_clicked:
-        # 单条 insert（prepare=False）稳定
         pg_exec(
             """
             INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
