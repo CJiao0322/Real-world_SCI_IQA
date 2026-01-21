@@ -405,8 +405,8 @@ def render_training():
     use_container_width=False,   # ✅ 不强行拉伸
     output_format="PNG",         # ✅ 强制不转 JPEG
 )    
-    w = st.slider("Zoom (px width)", 800, 2400, 1600, step=100)
-    st.image(paths[idx], caption=caps[idx], width=w, output_format="PNG")
+    # w = st.slider("Zoom (px width)", 800, 2400, 1600, step=100)
+    # st.image(paths[idx], caption=caps[idx], width=w, output_format="PNG")
 
 
 
