@@ -586,38 +586,76 @@ def render_rating():
             st.error("缺少 R2_PUBLIC_BASE_URL（线上必须走 R2）")
             st.stop()
 
-    with right:
-        st.markdown("### Rate image quality")
+    # with right:
+    #     st.markdown("### Rate image quality")
 
-        with st.form(key=f"rate_form_{done}", clear_on_submit=True):
-            score = st.radio(
-                "",
-                options=[5, 4, 3, 2, 1],
-                index=None,
-                format_func=lambda x: f"{x} — {LABELS[x]}",
-                label_visibility="collapsed",
-            )
+    #     with st.form(key=f"rate_form_{done}", clear_on_submit=True):
+    #         score = st.radio(
+    #             "",
+    #             options=[5, 4, 3, 2, 1],
+    #             index=None,
+    #             format_func=lambda x: f"{x} — {LABELS[x]}",
+    #             label_visibility="collapsed",
+    #         )
 
-            st.markdown("**Text clarity / 文本清晰度**")
-            text_clarity = st.radio(
-                "",
-                options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
-                index=None,
-                label_visibility="collapsed",
-            )
+    #         st.markdown("**Text clarity / 文本清晰度**")
+    #         text_clarity = st.radio(
+    #             "",
+    #             options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
+    #             index=None,
+    #             label_visibility="collapsed",
+    #         )
 
-            submitted = st.form_submit_button("Next", disabled=(score is None or text_clarity is None))
+    #         submitted = st.form_submit_button("Next", disabled=(score is None or text_clarity is None))
 
-        if submitted:
-            pg_exec(
-                """
-                INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
-            )
-            st.session_state.idx += 1
-            st.rerun()
+    #     if submitted:
+    #         pg_exec(
+    #             """
+    #             INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
+    #             VALUES (%s,%s,%s,%s,%s,%s,%s)
+    #             """,
+    #             (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
+    #         )
+    #         st.session_state.idx += 1
+    #         st.rerun()
+with right:
+    st.markdown("### Rate image quality")
+
+    with st.form(key=f"rate_form_{done}", clear_on_submit=True):
+        score = st.radio(
+            "",
+            options=[5, 4, 3, 2, 1],
+            index=None,
+            format_func=lambda x: f"{x} — {LABELS[x]}",
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**Text clarity / 文本清晰度**")
+        text_clarity = st.radio(
+            "",
+            options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
+            index=None,
+            label_visibility="collapsed",
+        )
+
+        submitted = st.form_submit_button("Next")
+
+    # ✅ 提交后再校验（这是关键）
+    if submitted:
+        if score is None or text_clarity is None:
+            st.warning("Please select both image quality and text clarity.")
+            st.stop()
+
+        pg_exec(
+            """
+            INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
+        )
+        st.session_state.idx += 1
+        st.rerun()
+
 
 def render_done():
     st.success("Thank you for participating! / 感谢参与！")
