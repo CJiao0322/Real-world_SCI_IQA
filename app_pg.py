@@ -669,96 +669,13 @@ def render_training():
         st.rerun()
 
 
-# def render_rating():
-#     pid = st.session_state.participant_id
-#     if not pid:
-#         st.error("No participant id.")
-#         st.stop()
-
-#     assigned_ids = get_assigned_image_ids(pid)
-#     total = len(assigned_ids)
-#     done = st.session_state.idx
-
-#     if total == 0:
-#         st.error("该参与者 assignments 为空（可能 assign_images_for_participant 没执行成功）")
-#         st.stop()
-
-#     if "rating_start_ts" not in st.session_state:
-#         st.session_state.rating_start_ts = time.time()
-
-#     elapsed = time.time() - st.session_state.rating_start_ts
-#     sec_per = elapsed / max(1, done)
-#     remaining_sec = max(0, (total - done) * sec_per)
-
-#     st.progress(done / total, text=f"Progress: {done}/{total} images completed")
-#     st.caption(f"Elapsed: {elapsed/60:.1f} min · Avg: {sec_per:.1f}s/image · ETA: {remaining_sec/60:.1f} min")
-
-#     if done >= total:
-#         st.session_state.stage = "done"
-#         st.rerun()
-#         return
-
-#     image_id = assigned_ids[done]
-#     rel_path = get_rel_path(image_id)
-#     if not rel_path:
-#         st.error(f"images 表里找不到 image_id={image_id}")
-#         st.stop()
-
-#     left, right = st.columns([3.6, 1.4], gap="large")
-
-#     with left:
-#         if USE_R2:
-#             img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
-#             st.image(img_url, caption=rel_path, use_container_width=True)
-#         else:
-#             st.error("缺少 R2_PUBLIC_BASE_URL（线上必须走 R2）")
-#             st.stop()
-
-#     with right:
-#         st.markdown("### Rate image quality")
-
-#         score = st.radio(
-#             "",
-#             options=[5, 4, 3, 2, 1],
-#             index=None,
-#             key=f"score_{done}",
-#             format_func=lambda x: f"{x} — {LABELS[x]}",
-#             label_visibility="collapsed",
-#         )
-
-#         st.markdown("**Text clarity / 文本清晰度**")
-#         text_clarity = st.radio(
-#             "",
-#             options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
-#             index=None,
-#             key=f"text_{done}",
-#             label_visibility="collapsed",
-#         )
-
-#         next_clicked = st.button("Next", disabled=(score is None or text_clarity is None))
-
-#     if next_clicked:
-#         pg_exec(
-#             """
-#             INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
-#             VALUES (%s,%s,%s,%s,%s,%s,%s)
-#             """,
-#             (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
-#         )
-#         st.session_state.idx += 1
-#         st.rerun()
 def render_rating():
     pid = st.session_state.participant_id
     if not pid:
         st.error("No participant id.")
         st.stop()
 
-    # ✅ 第一次进入 rating 时，把 assignments 缓存到 session，避免每次 rerun 都查 DB
-    if "assigned_ids" not in st.session_state or st.session_state.get("assigned_pid") != pid:
-        st.session_state.assigned_ids = get_assigned_image_ids(pid)
-        st.session_state.assigned_pid = pid
-
-    assigned_ids = st.session_state.assigned_ids
+    assigned_ids = get_assigned_image_ids(pid)
     total = len(assigned_ids)
     done = st.session_state.idx
 
@@ -782,13 +699,7 @@ def render_rating():
         return
 
     image_id = assigned_ids[done]
-
-    # ✅ rel_path 也做个轻缓存：同一张图在 rerun 里不要重复查
-    cache_key = f"rel_{image_id}"
-    if cache_key not in st.session_state:
-        st.session_state[cache_key] = get_rel_path(image_id)
-
-    rel_path = st.session_state[cache_key]
+    rel_path = get_rel_path(image_id)
     if not rel_path:
         st.error(f"images 表里找不到 image_id={image_id}")
         st.stop()
@@ -798,7 +709,6 @@ def render_rating():
     with left:
         if USE_R2:
             img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
-            # 如果你还想更快 + 不触发 Streamlit 额外处理，可以换成 components.html 的 <img>
             st.image(img_url, caption=rel_path, use_container_width=True)
         else:
             st.error("缺少 R2_PUBLIC_BASE_URL（线上必须走 R2）")
@@ -807,40 +717,130 @@ def render_rating():
     with right:
         st.markdown("### Rate image quality")
 
-        # ✅ 关键：用 form，把两个 radio + Next 放进同一个提交
-        with st.form(key=f"rate_form_{done}", clear_on_submit=True):
-            score = st.radio(
-                "",
-                options=[5, 4, 3, 2, 1],
-                index=None,
-                format_func=lambda x: f"{x} — {LABELS[x]}",
-                label_visibility="collapsed",
-            )
+        score = st.radio(
+            "",
+            options=[5, 4, 3, 2, 1],
+            index=None,
+            key=f"score_{done}",
+            format_func=lambda x: f"{x} — {LABELS[x]}",
+            label_visibility="collapsed",
+        )
 
-            st.markdown("**Text clarity / 文本清晰度**")
-            text_clarity = st.radio(
-                "",
-                options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
-                index=None,
-                label_visibility="collapsed",
-            )
+        st.markdown("**Text clarity / 文本清晰度**")
+        text_clarity = st.radio(
+            "",
+            options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
+            index=None,
+            key=f"text_{done}",
+            label_visibility="collapsed",
+        )
 
-            submitted = st.form_submit_button(
-                "Next",
-                disabled=(score is None or text_clarity is None)
-            )
+        next_clicked = st.button("Next", disabled=(score is None or text_clarity is None))
 
-        if submitted:
-            pg_exec(
-                """
-                INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
-            )
+    if next_clicked:
+        pg_exec(
+            """
+            INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
+        )
+        st.session_state.idx += 1
+        st.rerun()
+# def render_rating():
+#     pid = st.session_state.participant_id
+#     if not pid:
+#         st.error("No participant id.")
+#         st.stop()
 
-            st.session_state.idx += 1
-            st.rerun()
+#     # ✅ 第一次进入 rating 时，把 assignments 缓存到 session，避免每次 rerun 都查 DB
+#     if "assigned_ids" not in st.session_state or st.session_state.get("assigned_pid") != pid:
+#         st.session_state.assigned_ids = get_assigned_image_ids(pid)
+#         st.session_state.assigned_pid = pid
+
+#     assigned_ids = st.session_state.assigned_ids
+#     total = len(assigned_ids)
+#     done = st.session_state.idx
+
+#     if total == 0:
+#         st.error("该参与者 assignments 为空（可能 assign_images_for_participant 没执行成功）")
+#         st.stop()
+
+#     if "rating_start_ts" not in st.session_state:
+#         st.session_state.rating_start_ts = time.time()
+
+#     elapsed = time.time() - st.session_state.rating_start_ts
+#     sec_per = elapsed / max(1, done)
+#     remaining_sec = max(0, (total - done) * sec_per)
+
+#     st.progress(done / total, text=f"Progress: {done}/{total} images completed")
+#     st.caption(f"Elapsed: {elapsed/60:.1f} min · Avg: {sec_per:.1f}s/image · ETA: {remaining_sec/60:.1f} min")
+
+#     if done >= total:
+#         st.session_state.stage = "done"
+#         st.rerun()
+#         return
+
+#     image_id = assigned_ids[done]
+
+#     # ✅ rel_path 也做个轻缓存：同一张图在 rerun 里不要重复查
+#     cache_key = f"rel_{image_id}"
+#     if cache_key not in st.session_state:
+#         st.session_state[cache_key] = get_rel_path(image_id)
+
+#     rel_path = st.session_state[cache_key]
+#     if not rel_path:
+#         st.error(f"images 表里找不到 image_id={image_id}")
+#         st.stop()
+
+#     left, right = st.columns([3.6, 1.4], gap="large")
+
+#     with left:
+#         if USE_R2:
+#             img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
+#             # 如果你还想更快 + 不触发 Streamlit 额外处理，可以换成 components.html 的 <img>
+#             st.image(img_url, caption=rel_path, use_container_width=True)
+#         else:
+#             st.error("缺少 R2_PUBLIC_BASE_URL（线上必须走 R2）")
+#             st.stop()
+
+#     with right:
+#         st.markdown("### Rate image quality")
+
+#         # ✅ 关键：用 form，把两个 radio + Next 放进同一个提交
+#         with st.form(key=f"rate_form_{done}", clear_on_submit=True):
+#             score = st.radio(
+#                 "",
+#                 options=[5, 4, 3, 2, 1],
+#                 index=None,
+#                 format_func=lambda x: f"{x} — {LABELS[x]}",
+#                 label_visibility="collapsed",
+#             )
+
+#             st.markdown("**Text clarity / 文本清晰度**")
+#             text_clarity = st.radio(
+#                 "",
+#                 options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
+#                 index=None,
+#                 label_visibility="collapsed",
+#             )
+
+#             submitted = st.form_submit_button(
+#                 "Next",
+#                 disabled=(score is None or text_clarity is None)
+#             )
+
+#         if submitted:
+#             pg_exec(
+#                 """
+#                 INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
+#                 VALUES (%s,%s,%s,%s,%s,%s,%s)
+#                 """,
+#                 (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
+#             )
+
+#             st.session_state.idx += 1
+#             st.rerun()
 
 
 def render_done():
