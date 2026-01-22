@@ -12,6 +12,7 @@ from streamlit_js_eval import streamlit_js_eval
 
 import psycopg
 from psycopg_pool import ConnectionPool
+from psycopg_pool import PoolTimeout
 
 st.set_page_config(layout="wide")
 
@@ -34,7 +35,6 @@ TRAIN_FILES = [
     "4good.png",
     "5excellent.png",
 ]
-TRAIN_INTERVAL_MS = 3500
 
 LABELS = {
     1: "Bad（差）— 严重失真，如明显模糊、强噪声、文本难以辨认",
@@ -45,17 +45,23 @@ LABELS = {
 }
 
 # =========================
+# DB tuning knobs
+# =========================
+# 关键：Supabase（尤其 free）不适合开很大的真实 PG 连接数
+POOL_MAX_SIZE = int(os.environ.get("PG_POOL_MAX_SIZE", "4"))
+POOL_TIMEOUT_SEC = float(os.environ.get("PG_POOL_TIMEOUT_SEC", "8"))
+CONNECT_TIMEOUT_SEC = int(os.environ.get("PG_CONNECT_TIMEOUT_SEC", "5"))
+
+# =========================
 # One-time schema check (NO POOL)
 # =========================
 @st.cache_resource
 def ensure_schema_once():
     """
-    ✅ 关键修复：
-    - 不从 psycopg_pool 拿连接（避免 PoolTimeout）
-    - 只在进程生命周期执行一次
-    - 只做“兜底必须表 + slot 列迁移”
+    ✅ 只跑一次
+    ✅ 不依赖 psycopg_pool（避免启动阶段 pool 就卡死）
     """
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(DSN, connect_timeout=CONNECT_TIMEOUT_SEC) as conn:
         with conn.cursor() as cur:
             cur.execute("""
             CREATE TABLE IF NOT EXISTS participants (
@@ -90,7 +96,6 @@ def ensure_schema_once():
             );
             """)
 
-            # 兜底：slot_counter / exp_config（一般由 plan 脚本建好，但这里不影响）
             cur.execute("""
             CREATE TABLE IF NOT EXISTS slot_counter (
                 id INTEGER PRIMARY KEY DEFAULT 1,
@@ -114,7 +119,6 @@ def ensure_schema_once():
             );
             """)
 
-            # 自动迁移 slot 列（如果旧表没有）
             cur.execute("""
             DO $$
             BEGIN
@@ -131,39 +135,86 @@ def ensure_schema_once():
 ensure_schema_once()
 
 # =========================
-# DB Pool (FOR RUNTIME QUERIES ONLY)
+# DB Pool (shared)
 # =========================
 @st.cache_resource
 def get_pool():
-    # max_size 给大一点，避免并发/重跑时抢不到
-    # timeout 设短一点，避免页面卡 30 秒
-    return ConnectionPool(conninfo=DSN, min_size=1, max_size=10, timeout=8)
+    # ✅ 小池 + 短超时：避免把 Supabase 撑爆
+    # ✅ connect_timeout：避免握手卡住占用连接
+    return ConnectionPool(
+        conninfo=DSN,
+        min_size=1,
+        max_size=POOL_MAX_SIZE,
+        timeout=POOL_TIMEOUT_SEC,
+        kwargs={"connect_timeout": CONNECT_TIMEOUT_SEC},
+    )
 
 pool = get_pool()
 
+def _execute_with_fallback(fetch: str, sql: str, params=()):
+    """
+    fetch:
+      - "one": fetchone
+      - "all": fetchall
+      - "none": no fetch, commit
+    关键修复：
+    1) 先尝试 pool.connection()
+    2) 如果 PoolTimeout / 连接异常：降级为 direct psycopg.connect 执行一次
+    """
+    # --- 1) try pool ---
+    try:
+        with pool.connection(timeout=POOL_TIMEOUT_SEC) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params, prepare=False)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+            # fetch == "none"
+            conn.commit()
+            return None
+    except PoolTimeout:
+        # --- 2) fallback direct connect ---
+        with psycopg.connect(DSN, connect_timeout=CONNECT_TIMEOUT_SEC) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params, prepare=False)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+            conn.commit()
+            return None
+    except psycopg.Error:
+        # pool 里的某些连接坏掉/断开时，直接降级也能救
+        with psycopg.connect(DSN, connect_timeout=CONNECT_TIMEOUT_SEC) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params, prepare=False)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+            conn.commit()
+            return None
+
 def pg_fetchall(sql, params=()):
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params, prepare=False)
-            return cur.fetchall()
+    return _execute_with_fallback("all", sql, params)
 
 def pg_fetchone(sql, params=()):
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params, prepare=False)
-            return cur.fetchone()
+    return _execute_with_fallback("one", sql, params)
 
 def pg_exec(sql, params=()):
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params, prepare=False)
-        conn.commit()
+    _execute_with_fallback("none", sql, params)
 
 # =========================
 # Core helpers
 # =========================
-def get_exp_config():
+@st.cache_data(ttl=10, show_spinner=False)
+def get_exp_config_cached():
     r = pg_fetchone("SELECT n_images, k_per_person, p_total, r_target FROM exp_config WHERE id=1")
+    return r
+
+def get_exp_config():
+    r = get_exp_config_cached()
     if not r:
         st.error("数据库缺少 exp_config（你需要先运行 make_assignment_plan_from_manifest.py 导入）")
         st.stop()
@@ -173,30 +224,25 @@ def get_exp_config():
 def allocate_next_slot(p_total: int) -> int:
     if p_total <= 0:
         return 1
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH s AS (
-                    SELECT next_slot
-                    FROM slot_counter
-                    WHERE id=1
-                    FOR UPDATE
-                ),
-                u AS (
-                    UPDATE slot_counter
-                    SET next_slot = (s.next_slot %% %s) + 1
-                    FROM s
-                    WHERE id=1
-                    RETURNING s.next_slot AS slot_assigned
-                )
-                SELECT slot_assigned FROM u;
-                """,
-                (p_total,),
-                prepare=False
-            )
-            row = cur.fetchone()
-        conn.commit()
+    row = pg_fetchone(
+        """
+        WITH s AS (
+            SELECT next_slot
+            FROM slot_counter
+            WHERE id=1
+            FOR UPDATE
+        ),
+        u AS (
+            UPDATE slot_counter
+            SET next_slot = (s.next_slot %% %s) + 1
+            FROM s
+            WHERE id=1
+            RETURNING s.next_slot AS slot_assigned
+        )
+        SELECT slot_assigned FROM u;
+        """,
+        (p_total,)
+    )
     return int(row[0]) if row and row[0] is not None else 1
 
 def get_plan_image_ids_for_slot(slot: int):
@@ -233,19 +279,15 @@ def assign_images_for_participant(pid: str, slot: int):
     now = datetime.now()
     ords = list(range(len(image_ids)))
 
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
-                SELECT %s, x.image_id, x.ord, %s
-                FROM unnest(%s::text[], %s::int[]) AS x(image_id, ord)
-                ON CONFLICT DO NOTHING
-                """,
-                (pid, now, image_ids, ords),
-                prepare=False
-            )
-        conn.commit()
+    pg_exec(
+        """
+        INSERT INTO assignments (participant_id, image_id, ord, assigned_time)
+        SELECT %s, x.image_id, x.ord, %s
+        FROM unnest(%s::text[], %s::int[]) AS x(image_id, ord)
+        ON CONFLICT DO NOTHING
+        """,
+        (pid, now, image_ids, ords)
+    )
 
 def get_existing_participant_by_student(student_id: str):
     row = pg_fetchone(
@@ -317,7 +359,13 @@ if "idx" not in st.session_state:
 def render_intro():
     st.title("Image Quality Assessment Experiment")
 
-    n_images, k_per, p_total, r_target = get_exp_config()
+    try:
+        n_images, k_per, p_total, r_target = get_exp_config()
+    except Exception as e:
+        st.error("数据库暂时连接不上（可能 Supabase 连接被占满/网络抖动）。请刷新页面再试。")
+        st.code(repr(e))
+        st.stop()
+
     st.caption(f"Experiment config: N={n_images}, K/person={k_per}, P={p_total}, R_target={r_target}")
 
     with st.form("intro_form"):
@@ -436,13 +484,17 @@ def render_training():
             st.rerun()
 
     idx = st.session_state.train_idx
-    st.markdown(f"<div style='text-align:center; font-size:22px; font-weight:950;'>{caps[idx]}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div style='text-align:center; font-size:22px; font-weight:950;'>{caps[idx]}</div>",
+        unsafe_allow_html=True
+    )
 
     base = f"{R2_PUBLIC_BASE_URL}/{TRAIN_DIR}"
     cur_url = f"{base}/{TRAIN_FILES[idx]}"
     next_url = f"{base}/{TRAIN_FILES[(idx + 1) % len(TRAIN_FILES)]}"
     prev_url = f"{base}/{TRAIN_FILES[(idx - 1) % len(TRAIN_FILES)]}"
 
+    # ✅ 无滚动：一屏展示（contain），限制宽度，限制高度
     components.html(
         f"""
         <head>
@@ -486,7 +538,7 @@ def render_rating():
         st.error("No participant id.")
         st.stop()
 
-    # ✅ 缓存 assignments，减少 DB 压力/卡顿
+    # ✅ 缓存 assignments，减少 DB 压力
     if "assigned_ids" not in st.session_state or st.session_state.get("assigned_pid") != pid:
         st.session_state.assigned_ids = get_assigned_image_ids(pid)
         st.session_state.assigned_pid = pid
@@ -537,7 +589,6 @@ def render_rating():
     with right:
         st.markdown("### Rate image quality")
 
-        # ✅ 推荐：用 form，radio 不会触发 rerun，Next 更“立刻”
         with st.form(key=f"rate_form_{done}", clear_on_submit=True):
             score = st.radio(
                 "",
