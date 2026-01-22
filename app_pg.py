@@ -618,27 +618,27 @@ def render_rating():
     #         )
     #         st.session_state.idx += 1
     #         st.rerun()
-with right:
-    st.markdown("### Rate image quality")
-
-    with st.form(key=f"rate_form_{done}", clear_on_submit=True):
-        score = st.radio(
-            "",
-            options=[5, 4, 3, 2, 1],
-            index=None,
-            format_func=lambda x: f"{x} — {LABELS[x]}",
-            label_visibility="collapsed",
-        )
-
-        st.markdown("**Text clarity / 文本清晰度**")
-        text_clarity = st.radio(
-            "",
-            options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
-            index=None,
-            label_visibility="collapsed",
-        )
-
-        submitted = st.form_submit_button("Next")
+    with right:
+        st.markdown("### Rate image quality")
+    
+        with st.form(key=f"rate_form_{done}", clear_on_submit=True):
+            score = st.radio(
+                "",
+                options=[5, 4, 3, 2, 1],
+                index=None,
+                format_func=lambda x: f"{x} — {LABELS[x]}",
+                label_visibility="collapsed",
+            )
+    
+            st.markdown("**Text clarity / 文本清晰度**")
+            text_clarity = st.radio(
+                "",
+                options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
+                index=None,
+                label_visibility="collapsed",
+            )
+    
+            submitted = st.form_submit_button("Next")
 
     # ✅ 提交后再校验（这是关键）
     if submitted:
