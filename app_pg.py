@@ -143,7 +143,7 @@ def get_pool():
     # ✅ connect_timeout：避免握手卡住占用连接
     return ConnectionPool(
         conninfo=DSN,
-        min_size=1,
+        min_size=2,
         max_size=POOL_MAX_SIZE,
         timeout=POOL_TIMEOUT_SEC,
         kwargs={"connect_timeout": CONNECT_TIMEOUT_SEC},
