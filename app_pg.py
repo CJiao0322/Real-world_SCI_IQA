@@ -2,14 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import os
-import csv
 import time
-import random
-import io
-import base64
 from datetime import datetime
 from uuid import uuid4
-from PIL import Image
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -31,7 +26,6 @@ if not DSN:
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
 USE_R2 = bool(R2_PUBLIC_BASE_URL)
 
-# 训练图（你 GitHub 已经按这个放好了）
 TRAIN_DIR = "training_images"
 TRAIN_FILES = [
     "1bad.png",
@@ -51,12 +45,99 @@ LABELS = {
 }
 
 # =========================
-# DB Pool
+# One-time schema check (NO POOL)
+# =========================
+@st.cache_resource
+def ensure_schema_once():
+    """
+    ✅ 关键修复：
+    - 不从 psycopg_pool 拿连接（避免 PoolTimeout）
+    - 只在进程生命周期执行一次
+    - 只做“兜底必须表 + slot 列迁移”
+    """
+    with psycopg.connect(DSN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS participants (
+                participant_id TEXT PRIMARY KEY,
+                student_id TEXT,
+                device TEXT,
+                screen_resolution TEXT,
+                start_time TIMESTAMP,
+                slot INTEGER
+            );
+            """)
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS assignments (
+                participant_id TEXT NOT NULL,
+                image_id TEXT NOT NULL,
+                ord INTEGER NOT NULL,
+                assigned_time TIMESTAMP NOT NULL,
+                PRIMARY KEY (participant_id, image_id)
+            );
+            """)
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS ratings (
+                participant_id TEXT,
+                image_id TEXT,
+                image_name TEXT,
+                score INTEGER,
+                label TEXT,
+                time TIMESTAMP,
+                text_clarity TEXT
+            );
+            """)
+
+            # 兜底：slot_counter / exp_config（一般由 plan 脚本建好，但这里不影响）
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS slot_counter (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                next_slot INTEGER NOT NULL
+            );
+            """)
+            cur.execute("""
+            INSERT INTO slot_counter (id, next_slot)
+            VALUES (1, 1)
+            ON CONFLICT (id) DO NOTHING;
+            """)
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS exp_config (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                p_total INTEGER NOT NULL,
+                r_target INTEGER NOT NULL,
+                n_images INTEGER NOT NULL,
+                k_per_person INTEGER NOT NULL,
+                updated_at TIMESTAMP NOT NULL
+            );
+            """)
+
+            # 自动迁移 slot 列（如果旧表没有）
+            cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='participants' AND column_name='slot'
+                ) THEN
+                    ALTER TABLE participants ADD COLUMN slot INTEGER;
+                END IF;
+            END $$;
+            """)
+        conn.commit()
+
+ensure_schema_once()
+
+# =========================
+# DB Pool (FOR RUNTIME QUERIES ONLY)
 # =========================
 @st.cache_resource
 def get_pool():
-    # 不要往 DSN 里塞 prepare_threshold 等参数（你已经踩过坑）
-    return ConnectionPool(conninfo=DSN, min_size=1, max_size=3, timeout=30)
+    # max_size 给大一点，避免并发/重跑时抢不到
+    # timeout 设短一点，避免页面卡 30 秒
+    return ConnectionPool(conninfo=DSN, min_size=1, max_size=10, timeout=8)
 
 pool = get_pool()
 
@@ -78,104 +159,9 @@ def pg_exec(sql, params=()):
             cur.execute(sql, params, prepare=False)
         conn.commit()
 
-def ensure_schema():
-    """
-    ✅ 只做“确保存在/迁移”，不做清空
-    - 关键：给旧 participants 自动补 slot 列（否则你一定会遇到 UndefinedColumn）
-    - 确保 slot_counter / exp_config 存在
-    """
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            # participants（包含 slot）
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS participants (
-                participant_id TEXT PRIMARY KEY,
-                student_id TEXT,
-                device TEXT,
-                screen_resolution TEXT,
-                start_time TIMESTAMP,
-                slot INTEGER
-            );
-            """, prepare=False)
-
-            # assignments
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS assignments (
-                participant_id TEXT NOT NULL,
-                image_id TEXT NOT NULL,
-                ord INTEGER NOT NULL,
-                assigned_time TIMESTAMP NOT NULL,
-                PRIMARY KEY (participant_id, image_id)
-            );
-            """, prepare=False)
-
-            # ratings
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS ratings (
-                participant_id TEXT,
-                image_id TEXT,
-                image_name TEXT,
-                score INTEGER,
-                label TEXT,
-                time TIMESTAMP,
-                text_clarity TEXT
-            );
-            """, prepare=False)
-
-            # 这些一般由你的 plan 脚本创建/导入，但这里兜底一下（不影响已有数据）
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS slot_counter (
-                id INTEGER PRIMARY KEY DEFAULT 1,
-                next_slot INTEGER NOT NULL
-            );
-            """, prepare=False)
-            cur.execute("""
-            INSERT INTO slot_counter (id, next_slot)
-            VALUES (1, 1)
-            ON CONFLICT (id) DO NOTHING;
-            """, prepare=False)
-
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS exp_config (
-                id INTEGER PRIMARY KEY DEFAULT 1,
-                p_total INTEGER NOT NULL,
-                r_target INTEGER NOT NULL,
-                n_images INTEGER NOT NULL,
-                k_per_person INTEGER NOT NULL,
-                updated_at TIMESTAMP NOT NULL
-            );
-            """, prepare=False)
-
-            # ✅ 自动迁移：如果旧 participants 没有 slot，就补上
-            cur.execute("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='participants' AND column_name='slot'
-                ) THEN
-                    ALTER TABLE participants ADD COLUMN slot INTEGER;
-                END IF;
-            END $$;
-            """, prepare=False)
-
-        conn.commit()
-
-ensure_schema()
-
 # =========================
-# Helpers
+# Core helpers
 # =========================
-@st.cache_data(show_spinner=False)
-def image_as_data_url(img_path: str, max_side: int = 2400, quality: int = 88) -> str:
-    with Image.open(img_path) as im:
-        im = im.convert("RGB")
-        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=quality, optimize=True)
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        return f"data:image/jpeg;base64,{b64}"
-
 def get_exp_config():
     r = pg_fetchone("SELECT n_images, k_per_person, p_total, r_target FROM exp_config WHERE id=1")
     if not r:
@@ -185,15 +171,8 @@ def get_exp_config():
     return int(n_images), int(k_per), int(p_total), int(r_target)
 
 def allocate_next_slot(p_total: int) -> int:
-    """
-    ✅ 原子发号（强一致，不卡）
-    - 取出当前 next_slot（就是本次分配给用户的 slot）
-    - 然后把 next_slot 更新为下一位（循环 1..P）
-    - 用 FOR UPDATE 锁定这一行，避免并发冲突
-    """
     if p_total <= 0:
-        raise ValueError("p_total must be > 0")
-
+        return 1
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -218,11 +197,7 @@ def allocate_next_slot(p_total: int) -> int:
             )
             row = cur.fetchone()
         conn.commit()
-
-    if not row or row[0] is None:
-        # 极端情况兜底
-        return 1
-    return int(row[0])
+    return int(row[0]) if row and row[0] is not None else 1
 
 def get_plan_image_ids_for_slot(slot: int):
     rows = pg_fetchall(
@@ -243,10 +218,6 @@ def get_assigned_image_ids(pid: str):
     return [r[0] for r in rows]
 
 def assign_images_for_participant(pid: str, slot: int):
-    """
-    ✅ 超快：一次性 bulk insert（不 executemany，不 for 循环）
-    ✅ prepare=False：不会触发 prepared statement 冲突
-    """
     exist = pg_fetchone(
         "SELECT 1 FROM assignments WHERE participant_id=%s LIMIT 1",
         (pid,)
@@ -277,11 +248,6 @@ def assign_images_for_participant(pid: str, slot: int):
         conn.commit()
 
 def get_existing_participant_by_student(student_id: str):
-    """
-    返回最近一次 participant 记录（优先未完成的）。
-    participants 表里要有 student_id 和 slot（你已经有 slot 列了）。
-    """
-    # 先找未完成的（ratings < assignments）
     row = pg_fetchone(
         """
         SELECT p.participant_id, p.slot
@@ -306,7 +272,6 @@ def get_existing_participant_by_student(student_id: str):
     if row:
         return row[0], int(row[1])
 
-    # 否则取最近一次（可能已完成）
     row2 = pg_fetchone(
         """
         SELECT participant_id, slot
@@ -322,27 +287,17 @@ def get_existing_participant_by_student(student_id: str):
 
     return None
 
-
 def get_progress(pid: str):
-    """
-    返回 (done, total)
-    """
     done = pg_fetchone("SELECT COUNT(*) FROM ratings WHERE participant_id=%s", (pid,))[0]
     total = pg_fetchone("SELECT COUNT(*) FROM assignments WHERE participant_id=%s", (pid,))[0]
     return int(done), int(total)
 
-
 def restore_session(pid: str, slot: int):
-    """
-    把 session_state 恢复到继续打分的位置。
-    """
     done, total = get_progress(pid)
     st.session_state.participant_id = pid
     st.session_state.slot = slot
-    st.session_state.idx = done  # ✅ 关键：从已完成数量继续
+    st.session_state.idx = done
     st.session_state.stage = "rating" if done < total else "done"
-
-
 
 # =========================
 # Session State
@@ -359,74 +314,6 @@ if "idx" not in st.session_state:
 # =========================
 # Pages
 # =========================
-# def render_intro():
-#     st.title("Image Quality Assessment Experiment")
-
-#     n_images, k_per, p_total, r_target = get_exp_config()
-#     st.caption(f"Experiment config: N={n_images}, K/person={k_per}, P={p_total}, R_target={r_target}")
-
-#     with st.form("intro_form"):
-#         student_id = st.text_input("Student ID / 学号", "")
-#         device = st.selectbox("Device / 设备", ["PC / Laptop", "Tablet", "Phone", "Other"])
-
-#         detected_physical = streamlit_js_eval(
-#             js_expressions="""
-#             (() => {
-#               const sw = screen.width, sh = screen.height;
-#               const dpr = window.devicePixelRatio || 1;
-#               const pw = Math.round(sw * dpr);
-#               const ph = Math.round(sh * dpr);
-#               return `${pw}x${ph}`;
-#             })()
-#             """,
-#             key="DETECTED_PHYSICAL",
-#             want_output=True,
-#         )
-
-#         resolution_choice = st.selectbox(
-#             "Screen Resolution / 请选择屏幕分辨率",
-#             ["1920×1080", "2560×1440", "3840×2160", "I don’t know (auto-detect)", "Other"],
-#         )
-
-#         if resolution_choice == "I don’t know (auto-detect)":
-#             st.caption(f"Auto-detected physical resolution: {detected_physical}")
-
-#         submitted = st.form_submit_button("Start Experiment")
-
-#     if not submitted:
-#         return
-#     if student_id.strip() == "":
-#         st.error("Please enter your student ID.")
-#         return
-
-#     if resolution_choice == "I don’t know (auto-detect)":
-#         screen_resolution = f"auto:{detected_physical or 'unknown'}"
-#     elif resolution_choice == "Other":
-#         screen_resolution = "manual:other"
-#     else:
-#         screen_resolution = f"manual:{resolution_choice.replace('×','x')}"
-
-#     pid = str(uuid4())
-
-#     # ✅ 原子发 slot
-#     slot = allocate_next_slot(p_total)
-
-#     # 写 participants（包含 slot）
-#     pg_exec(
-#         """
-#         INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time, slot)
-#         VALUES (%s,%s,%s,%s,%s,%s)
-#         """,
-#         (pid, student_id.strip(), device, screen_resolution, datetime.now(), slot)
-#     )
-
-#     # 写 assignments（来自 assignment_plan）
-#     assign_images_for_participant(pid, slot)
-
-#     st.session_state.participant_id = pid
-#     st.session_state.slot = slot
-#     st.session_state.stage = "training"
-#     st.rerun()
 def render_intro():
     st.title("Image Quality Assessment Experiment")
 
@@ -467,7 +354,6 @@ def render_intro():
         st.error("Please enter your student ID.")
         return
 
-    # ====== 解析 screen_resolution ======
     if resolution_choice == "I don’t know (auto-detect)":
         screen_resolution = f"auto:{detected_physical or 'unknown'}"
     elif resolution_choice == "Other":
@@ -477,29 +363,20 @@ def render_intro():
 
     sid = student_id.strip()
 
-    # ====== ✅ 先尝试恢复（按学号） ======
     existing = get_existing_participant_by_student(sid)
     if existing:
         old_pid, old_slot = existing
         done, total = get_progress(old_pid)
-
-        # 有未完成进度：直接恢复到 rating
         if total > 0 and done < total:
             st.success(f"检测到你之前未完成的进度：{done}/{total}，已为你继续。")
             restore_session(old_pid, old_slot)
             st.rerun()
             return
-
-        # 已完成：提示一下，然后走“新建一轮”
         st.info("检测到你之前已经完成过本实验。本次将开始新一轮。")
 
-    # ====== 没有可恢复的：新建 participant ======
     pid = str(uuid4())
-
-    # ✅ 原子发 slot
     slot = allocate_next_slot(p_total)
 
-    # 写 participants（包含 slot）
     pg_exec(
         """
         INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time, slot)
@@ -508,14 +385,12 @@ def render_intro():
         (pid, sid, device, screen_resolution, datetime.now(), slot)
     )
 
-    # 写 assignments（来自 assignment_plan）
     assign_images_for_participant(pid, slot)
 
     st.session_state.participant_id = pid
     st.session_state.slot = slot
     st.session_state.stage = "training"
     st.rerun()
-
 
 def render_training():
     st.markdown(
@@ -535,7 +410,6 @@ def render_training():
         unsafe_allow_html=True,
     )
 
-    # 训练图片说明
     caps = [
         f"1 — {LABELS[1]}",
         f"2 — {LABELS[2]}",
@@ -544,119 +418,57 @@ def render_training():
         f"5 — {LABELS[5]}",
     ]
 
-    # ✅ 强制走 R2（浏览器直连拉图，速度/缓存最好）
     if not USE_R2:
-        st.error("Training 阶段已改为从 R2 拉图，但你没有设置 R2_PUBLIC_BASE_URL。")
+        st.error("Training 阶段需要 R2_PUBLIC_BASE_URL（建议走 R2）")
         st.stop()
 
-    # session state
     if "train_idx" not in st.session_state:
         st.session_state.train_idx = 0
 
-    # 左右按钮
-    colA, colB, colC = st.columns([1, 6, 1], vertical_alignment="center")
+    colA, _, colC = st.columns([1, 6, 1], vertical_alignment="center")
     with colA:
         if st.button("← Prev", use_container_width=True):
             st.session_state.train_idx = (st.session_state.train_idx - 1) % len(TRAIN_FILES)
             st.rerun()
-
     with colC:
         if st.button("Next →", use_container_width=True):
             st.session_state.train_idx = (st.session_state.train_idx + 1) % len(TRAIN_FILES)
             st.rerun()
 
     idx = st.session_state.train_idx
-    st.markdown(
-        f"<div style='text-align:center; font-size:22px; font-weight:950;'>{caps[idx]}</div>",
-        unsafe_allow_html=True
-    )
+    st.markdown(f"<div style='text-align:center; font-size:22px; font-weight:950;'>{caps[idx]}</div>", unsafe_allow_html=True)
 
-    # ✅ 直接给浏览器一个 URL：不经 Streamlit/PIL 转码，不会“变糊”，且可走 CDN 缓存
     base = f"{R2_PUBLIC_BASE_URL}/{TRAIN_DIR}"
-    cur_url  = f"{base}/{TRAIN_FILES[idx]}"
+    cur_url = f"{base}/{TRAIN_FILES[idx]}"
     next_url = f"{base}/{TRAIN_FILES[(idx + 1) % len(TRAIN_FILES)]}"
     prev_url = f"{base}/{TRAIN_FILES[(idx - 1) % len(TRAIN_FILES)]}"
 
-    # ✅ 用 components.html + <img>，完全绕开 st.image 的“中间处理”
-    # ✅ 预加载前后两张，翻页更快
-    # components.html(
-    #     f"""
-    #     <head>
-    #       <link rel="preload" as="image" href="{next_url}">
-    #       <link rel="preload" as="image" href="{prev_url}">
-    #     </head>
-    #     <div style="width:100%; height:78vh; overflow:auto; border:1px solid #eee; border-radius:8px;">
-    #       <img src="{cur_url}"
-    #            style="display:block; max-width:none; height:auto;"
-    #            decoding="async"
-    #            loading="eager"
-    #       />
-    #     </div>
-    #     <div style="font-size:12px; opacity:0.7; margin-top:6px;">
-    #       Source: {cur_url}
-    #     </div>
-    #     """,
-    #     height=410,
-    # )
-#     components.html(
-#     f"""
-#     <div style="
-#         width:100%;
-#         height:78vh;
-#         overflow:auto;
-#         border:1px solid #eee;
-#         border-radius:8px;
-#         display:flex;
-#         justify-content:center;
-#         align-items:flex-start;
-#         background:#fafafa;
-#     ">
-#       <img src="{cur_url}"
-#            style="
-#              max-width:1600px;   /* 👈 关键：限制最大显示宽度 */
-#              width:100%;
-#              height:auto;
-#              object-fit:contain;
-#              image-rendering:auto;
-#            "
-#            decoding="async"
-#            loading="eager"
-#       />
-#     </div>
-#     """,
-#     height=820,
-# )
     components.html(
-    f"""
-    <div style="
-        width:100%;
-        height:78vh;                 /* 固定展示高度 */
-        border:1px solid #eee;
-        border-radius:8px;
-        display:flex;
-        justify-content:center;
-        align-items:center;
-        background:#fafafa;
-        overflow:hidden;             /* 👈 禁止滚动 */
-    ">
-      <img src="{cur_url}"
-           style="
-             max-width:1600px;        /* 限制最大宽度 */
-             max-height:100%;         /* 👈 高度受容器约束 */
-             width:auto;
-             height:auto;
-             object-fit:contain;      /* 等比例缩放 */
-             image-rendering:auto;
-           "
-           decoding="async"
-           loading="eager"
-      />
-    </div>
-    """,
-    height=820,
-)
-
-
+        f"""
+        <head>
+          <link rel="preload" as="image" href="{next_url}">
+          <link rel="preload" as="image" href="{prev_url}">
+        </head>
+        <div style="
+            width:100%;
+            height:78vh;
+            border:1px solid #eee;
+            border-radius:8px;
+            display:flex;
+            justify-content:center;
+            align-items:center;
+            background:#fafafa;
+            overflow:hidden;
+        ">
+          <img src="{cur_url}"
+               style="max-width:1600px; max-height:100%; width:auto; height:auto; object-fit:contain;"
+               decoding="async"
+               loading="eager"
+          />
+        </div>
+        """,
+        height=820,
+    )
 
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
@@ -668,14 +480,18 @@ def render_training():
             del st.session_state["train_idx"]
         st.rerun()
 
-
 def render_rating():
     pid = st.session_state.participant_id
     if not pid:
         st.error("No participant id.")
         st.stop()
 
-    assigned_ids = get_assigned_image_ids(pid)
+    # ✅ 缓存 assignments，减少 DB 压力/卡顿
+    if "assigned_ids" not in st.session_state or st.session_state.get("assigned_pid") != pid:
+        st.session_state.assigned_ids = get_assigned_image_ids(pid)
+        st.session_state.assigned_pid = pid
+
+    assigned_ids = st.session_state.assigned_ids
     total = len(assigned_ids)
     done = st.session_state.idx
 
@@ -699,7 +515,11 @@ def render_rating():
         return
 
     image_id = assigned_ids[done]
-    rel_path = get_rel_path(image_id)
+    rel_key = f"rel_{image_id}"
+    if rel_key not in st.session_state:
+        st.session_state[rel_key] = get_rel_path(image_id)
+    rel_path = st.session_state[rel_key]
+
     if not rel_path:
         st.error(f"images 表里找不到 image_id={image_id}")
         st.stop()
@@ -717,131 +537,36 @@ def render_rating():
     with right:
         st.markdown("### Rate image quality")
 
-        score = st.radio(
-            "",
-            options=[5, 4, 3, 2, 1],
-            index=None,
-            key=f"score_{done}",
-            format_func=lambda x: f"{x} — {LABELS[x]}",
-            label_visibility="collapsed",
-        )
+        # ✅ 推荐：用 form，radio 不会触发 rerun，Next 更“立刻”
+        with st.form(key=f"rate_form_{done}", clear_on_submit=True):
+            score = st.radio(
+                "",
+                options=[5, 4, 3, 2, 1],
+                index=None,
+                format_func=lambda x: f"{x} — {LABELS[x]}",
+                label_visibility="collapsed",
+            )
 
-        st.markdown("**Text clarity / 文本清晰度**")
-        text_clarity = st.radio(
-            "",
-            options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
-            index=None,
-            key=f"text_{done}",
-            label_visibility="collapsed",
-        )
+            st.markdown("**Text clarity / 文本清晰度**")
+            text_clarity = st.radio(
+                "",
+                options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
+                index=None,
+                label_visibility="collapsed",
+            )
 
-        next_clicked = st.button("Next", disabled=(score is None or text_clarity is None))
+            submitted = st.form_submit_button("Next", disabled=(score is None or text_clarity is None))
 
-    if next_clicked:
-        pg_exec(
-            """
-            INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-            """,
-            (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
-        )
-        st.session_state.idx += 1
-        st.rerun()
-# def render_rating():
-#     pid = st.session_state.participant_id
-#     if not pid:
-#         st.error("No participant id.")
-#         st.stop()
-
-#     # ✅ 第一次进入 rating 时，把 assignments 缓存到 session，避免每次 rerun 都查 DB
-#     if "assigned_ids" not in st.session_state or st.session_state.get("assigned_pid") != pid:
-#         st.session_state.assigned_ids = get_assigned_image_ids(pid)
-#         st.session_state.assigned_pid = pid
-
-#     assigned_ids = st.session_state.assigned_ids
-#     total = len(assigned_ids)
-#     done = st.session_state.idx
-
-#     if total == 0:
-#         st.error("该参与者 assignments 为空（可能 assign_images_for_participant 没执行成功）")
-#         st.stop()
-
-#     if "rating_start_ts" not in st.session_state:
-#         st.session_state.rating_start_ts = time.time()
-
-#     elapsed = time.time() - st.session_state.rating_start_ts
-#     sec_per = elapsed / max(1, done)
-#     remaining_sec = max(0, (total - done) * sec_per)
-
-#     st.progress(done / total, text=f"Progress: {done}/{total} images completed")
-#     st.caption(f"Elapsed: {elapsed/60:.1f} min · Avg: {sec_per:.1f}s/image · ETA: {remaining_sec/60:.1f} min")
-
-#     if done >= total:
-#         st.session_state.stage = "done"
-#         st.rerun()
-#         return
-
-#     image_id = assigned_ids[done]
-
-#     # ✅ rel_path 也做个轻缓存：同一张图在 rerun 里不要重复查
-#     cache_key = f"rel_{image_id}"
-#     if cache_key not in st.session_state:
-#         st.session_state[cache_key] = get_rel_path(image_id)
-
-#     rel_path = st.session_state[cache_key]
-#     if not rel_path:
-#         st.error(f"images 表里找不到 image_id={image_id}")
-#         st.stop()
-
-#     left, right = st.columns([3.6, 1.4], gap="large")
-
-#     with left:
-#         if USE_R2:
-#             img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
-#             # 如果你还想更快 + 不触发 Streamlit 额外处理，可以换成 components.html 的 <img>
-#             st.image(img_url, caption=rel_path, use_container_width=True)
-#         else:
-#             st.error("缺少 R2_PUBLIC_BASE_URL（线上必须走 R2）")
-#             st.stop()
-
-#     with right:
-#         st.markdown("### Rate image quality")
-
-#         # ✅ 关键：用 form，把两个 radio + Next 放进同一个提交
-#         with st.form(key=f"rate_form_{done}", clear_on_submit=True):
-#             score = st.radio(
-#                 "",
-#                 options=[5, 4, 3, 2, 1],
-#                 index=None,
-#                 format_func=lambda x: f"{x} — {LABELS[x]}",
-#                 label_visibility="collapsed",
-#             )
-
-#             st.markdown("**Text clarity / 文本清晰度**")
-#             text_clarity = st.radio(
-#                 "",
-#                 options=["Clear（清晰）", "Not clear（不清晰）", "No text（无文本）"],
-#                 index=None,
-#                 label_visibility="collapsed",
-#             )
-
-#             submitted = st.form_submit_button(
-#                 "Next",
-#                 disabled=(score is None or text_clarity is None)
-#             )
-
-#         if submitted:
-#             pg_exec(
-#                 """
-#                 INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
-#                 VALUES (%s,%s,%s,%s,%s,%s,%s)
-#                 """,
-#                 (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
-#             )
-
-#             st.session_state.idx += 1
-#             st.rerun()
-
+        if submitted:
+            pg_exec(
+                """
+                INSERT INTO ratings (participant_id, image_id, image_name, score, label, time, text_clarity)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (pid, image_id, rel_path, int(score), LABELS[int(score)], datetime.now(), str(text_clarity))
+            )
+            st.session_state.idx += 1
+            st.rerun()
 
 def render_done():
     st.success("Thank you for participating! / 感谢参与！")
