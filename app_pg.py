@@ -276,6 +276,74 @@ def assign_images_for_participant(pid: str, slot: int):
             )
         conn.commit()
 
+def get_existing_participant_by_student(student_id: str):
+    """
+    返回最近一次 participant 记录（优先未完成的）。
+    participants 表里要有 student_id 和 slot（你已经有 slot 列了）。
+    """
+    # 先找未完成的（ratings < assignments）
+    row = pg_fetchone(
+        """
+        SELECT p.participant_id, p.slot
+        FROM participants p
+        JOIN (
+          SELECT participant_id, COUNT(*) AS n_assign
+          FROM assignments
+          GROUP BY participant_id
+        ) a ON a.participant_id = p.participant_id
+        LEFT JOIN (
+          SELECT participant_id, COUNT(*) AS n_rate
+          FROM ratings
+          GROUP BY participant_id
+        ) r ON r.participant_id = p.participant_id
+        WHERE p.student_id = %s
+          AND COALESCE(r.n_rate, 0) < a.n_assign
+        ORDER BY p.start_time DESC
+        LIMIT 1
+        """,
+        (student_id,)
+    )
+    if row:
+        return row[0], int(row[1])
+
+    # 否则取最近一次（可能已完成）
+    row2 = pg_fetchone(
+        """
+        SELECT participant_id, slot
+        FROM participants
+        WHERE student_id=%s
+        ORDER BY start_time DESC
+        LIMIT 1
+        """,
+        (student_id,)
+    )
+    if row2:
+        return row2[0], int(row2[1])
+
+    return None
+
+
+def get_progress(pid: str):
+    """
+    返回 (done, total)
+    """
+    done = pg_fetchone("SELECT COUNT(*) FROM ratings WHERE participant_id=%s", (pid,))[0]
+    total = pg_fetchone("SELECT COUNT(*) FROM assignments WHERE participant_id=%s", (pid,))[0]
+    return int(done), int(total)
+
+
+def restore_session(pid: str, slot: int):
+    """
+    把 session_state 恢复到继续打分的位置。
+    """
+    done, total = get_progress(pid)
+    st.session_state.participant_id = pid
+    st.session_state.slot = slot
+    st.session_state.idx = done  # ✅ 关键：从已完成数量继续
+    st.session_state.stage = "rating" if done < total else "done"
+
+
+
 # =========================
 # Session State
 # =========================
@@ -291,6 +359,74 @@ if "idx" not in st.session_state:
 # =========================
 # Pages
 # =========================
+# def render_intro():
+#     st.title("Image Quality Assessment Experiment")
+
+#     n_images, k_per, p_total, r_target = get_exp_config()
+#     st.caption(f"Experiment config: N={n_images}, K/person={k_per}, P={p_total}, R_target={r_target}")
+
+#     with st.form("intro_form"):
+#         student_id = st.text_input("Student ID / 学号", "")
+#         device = st.selectbox("Device / 设备", ["PC / Laptop", "Tablet", "Phone", "Other"])
+
+#         detected_physical = streamlit_js_eval(
+#             js_expressions="""
+#             (() => {
+#               const sw = screen.width, sh = screen.height;
+#               const dpr = window.devicePixelRatio || 1;
+#               const pw = Math.round(sw * dpr);
+#               const ph = Math.round(sh * dpr);
+#               return `${pw}x${ph}`;
+#             })()
+#             """,
+#             key="DETECTED_PHYSICAL",
+#             want_output=True,
+#         )
+
+#         resolution_choice = st.selectbox(
+#             "Screen Resolution / 请选择屏幕分辨率",
+#             ["1920×1080", "2560×1440", "3840×2160", "I don’t know (auto-detect)", "Other"],
+#         )
+
+#         if resolution_choice == "I don’t know (auto-detect)":
+#             st.caption(f"Auto-detected physical resolution: {detected_physical}")
+
+#         submitted = st.form_submit_button("Start Experiment")
+
+#     if not submitted:
+#         return
+#     if student_id.strip() == "":
+#         st.error("Please enter your student ID.")
+#         return
+
+#     if resolution_choice == "I don’t know (auto-detect)":
+#         screen_resolution = f"auto:{detected_physical or 'unknown'}"
+#     elif resolution_choice == "Other":
+#         screen_resolution = "manual:other"
+#     else:
+#         screen_resolution = f"manual:{resolution_choice.replace('×','x')}"
+
+#     pid = str(uuid4())
+
+#     # ✅ 原子发 slot
+#     slot = allocate_next_slot(p_total)
+
+#     # 写 participants（包含 slot）
+#     pg_exec(
+#         """
+#         INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time, slot)
+#         VALUES (%s,%s,%s,%s,%s,%s)
+#         """,
+#         (pid, student_id.strip(), device, screen_resolution, datetime.now(), slot)
+#     )
+
+#     # 写 assignments（来自 assignment_plan）
+#     assign_images_for_participant(pid, slot)
+
+#     st.session_state.participant_id = pid
+#     st.session_state.slot = slot
+#     st.session_state.stage = "training"
+#     st.rerun()
 def render_intro():
     st.title("Image Quality Assessment Experiment")
 
@@ -331,6 +467,7 @@ def render_intro():
         st.error("Please enter your student ID.")
         return
 
+    # ====== 解析 screen_resolution ======
     if resolution_choice == "I don’t know (auto-detect)":
         screen_resolution = f"auto:{detected_physical or 'unknown'}"
     elif resolution_choice == "Other":
@@ -338,6 +475,25 @@ def render_intro():
     else:
         screen_resolution = f"manual:{resolution_choice.replace('×','x')}"
 
+    sid = student_id.strip()
+
+    # ====== ✅ 先尝试恢复（按学号） ======
+    existing = get_existing_participant_by_student(sid)
+    if existing:
+        old_pid, old_slot = existing
+        done, total = get_progress(old_pid)
+
+        # 有未完成进度：直接恢复到 rating
+        if total > 0 and done < total:
+            st.success(f"检测到你之前未完成的进度：{done}/{total}，已为你继续。")
+            restore_session(old_pid, old_slot)
+            st.rerun()
+            return
+
+        # 已完成：提示一下，然后走“新建一轮”
+        st.info("检测到你之前已经完成过本实验。本次将开始新一轮。")
+
+    # ====== 没有可恢复的：新建 participant ======
     pid = str(uuid4())
 
     # ✅ 原子发 slot
@@ -349,7 +505,7 @@ def render_intro():
         INSERT INTO participants (participant_id, student_id, device, screen_resolution, start_time, slot)
         VALUES (%s,%s,%s,%s,%s,%s)
         """,
-        (pid, student_id.strip(), device, screen_resolution, datetime.now(), slot)
+        (pid, sid, device, screen_resolution, datetime.now(), slot)
     )
 
     # 写 assignments（来自 assignment_plan）
@@ -359,6 +515,7 @@ def render_intro():
     st.session_state.slot = slot
     st.session_state.stage = "training"
     st.rerun()
+
 
 def render_training():
     st.markdown(
