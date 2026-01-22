@@ -581,7 +581,52 @@ def render_rating():
     with left:
         if USE_R2:
             img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
-            st.image(img_url, caption=rel_path, use_container_width=True)
+
+            img_url = f"{R2_PUBLIC_BASE_URL}/{rel_path}"
+
+            # 预取下一张（如果有）
+            next_url = None
+            if done + 1 < total:
+                next_id = assigned_ids[done + 1]
+                next_rel = st.session_state.get(f"rel_{next_id}")
+                if not next_rel:
+                    next_rel = get_rel_path(next_id)
+                    st.session_state[f"rel_{next_id}"] = next_rel
+                if next_rel:
+                    next_url = f"{R2_PUBLIC_BASE_URL}/{next_rel}"
+
+            # st.image(img_url, caption=rel_path, use_container_width=True)
+            preload_html = ""
+            if next_url:
+                preload_html = f'<link rel="preload" as="image" href="{next_url}">'
+            
+            components.html(
+                f"""
+                <head>
+                  {preload_html}
+                </head>
+                <div style="
+                    width:100%;
+                    height:78vh;
+                    border:1px solid #eee;
+                    border-radius:8px;
+                    display:flex;
+                    justify-content:center;
+                    align-items:center;
+                    background:#fafafa;
+                    overflow:hidden;
+                ">
+                  <img src="{img_url}"
+                       style="max-width:1600px; max-height:100%; width:auto; height:auto; object-fit:contain;"
+                       decoding="async"
+                       loading="eager"
+                  />
+                </div>
+                <div style="font-size:12px; opacity:0.7; margin-top:6px;">{rel_path}</div>
+                """,
+                height=860,
+            )
+
         else:
             st.error("缺少 R2_PUBLIC_BASE_URL（线上必须走 R2）")
             st.stop()
