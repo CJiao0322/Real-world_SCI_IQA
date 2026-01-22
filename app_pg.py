@@ -56,7 +56,7 @@ LABELS = {
 @st.cache_resource
 def get_pool():
     # 不要往 DSN 里塞 prepare_threshold 等参数（你已经踩过坑）
-    return ConnectionPool(conninfo=DSN, min_size=1, max_size=10, timeout=30)
+    return ConnectionPool(conninfo=DSN, min_size=1, max_size=3, timeout=30)
 
 pool = get_pool()
 
